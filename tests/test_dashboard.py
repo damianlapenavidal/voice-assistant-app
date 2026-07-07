@@ -15,8 +15,9 @@ class TestDashboardEventLoop:
         session = SessionManager(transport)
         await session.wait_for_device()
 
-        dashboard = DashboardManager(session)
         main_loop = asyncio.get_running_loop()
+        dashboard = DashboardManager(session, main_loop=main_loop)
+        dashboard.set_web_loop(main_loop)
 
         result = await dashboard.handle_browser_command("start_session")
 
@@ -29,8 +30,9 @@ class TestDashboardEventLoop:
     async def test_session_event_broadcast_schedules_on_same_loop(self) -> None:
         transport = MockTransport()
         session = SessionManager(transport)
-        dashboard = DashboardManager(session)
         main_loop = asyncio.get_running_loop()
+        dashboard = DashboardManager(session, main_loop=main_loop)
+        dashboard.set_web_loop(main_loop)
 
         await session.wait_for_device()
         await asyncio.sleep(0)
@@ -48,11 +50,72 @@ class TestDashboardEventLoop:
         await session.wait_for_device()
         await session.start_conversation()
 
-        dashboard = DashboardManager(session)
         main_loop = asyncio.get_running_loop()
+        dashboard = DashboardManager(session, main_loop=main_loop)
+        dashboard.set_web_loop(main_loop)
 
         result = await dashboard.handle_browser_command("stop_session")
 
         assert result["status"] == "ok"
         assert session.state == SessionState.ACTIVE
         assert asyncio.get_running_loop() is main_loop
+
+    async def test_pause_then_resume_session(self) -> None:
+        transport = MockTransport()
+        session = SessionManager(transport)
+        await session.wait_for_device()
+        await session.start_conversation()
+
+        main_loop = asyncio.get_running_loop()
+        dashboard = DashboardManager(session, main_loop=main_loop)
+        dashboard.set_web_loop(main_loop)
+
+        pause_result = await dashboard.handle_browser_command("pause_session")
+        assert pause_result["status"] == "ok"
+        assert session.state == SessionState.PAUSED
+
+        resume_result = await dashboard.handle_browser_command("resume_session")
+        assert resume_result["status"] == "ok"
+        assert session.state == SessionState.STREAMING
+
+        await session.stop_conversation()
+
+    async def test_turn_on_after_shutdown(self) -> None:
+        transport = MockTransport()
+        session = SessionManager(transport)
+        await session.wait_for_device()
+        await session.shutdown_device()
+
+        main_loop = asyncio.get_running_loop()
+        dashboard = DashboardManager(session, main_loop=main_loop)
+        dashboard.set_web_loop(main_loop)
+
+        result = await dashboard.handle_browser_command("turn_on")
+
+        assert result["status"] == "ok"
+        # MockTransport completes its fake handshake near-instantly, so by the
+        # time the cross-thread command future resolves the state may already
+        # have advanced past CONNECTING to ACTIVE -- either is a valid sign
+        # that turn_on() re-armed the device server.
+        assert session.state in (SessionState.CONNECTING, SessionState.ACTIVE)
+
+        await session.stop_receive_loop()
+
+    async def test_stop_clears_transcripts_but_pause_does_not(self) -> None:
+        transport = MockTransport()
+        session = SessionManager(transport)
+        await session.wait_for_device()
+        await session.start_conversation()
+
+        main_loop = asyncio.get_running_loop()
+        dashboard = DashboardManager(session, main_loop=main_loop)
+        dashboard.set_web_loop(main_loop)
+
+        dashboard._transcripts.append({"role": "user", "text": "hi", "final": True})
+
+        await dashboard.handle_browser_command("pause_session")
+        assert len(dashboard._transcripts) == 1
+
+        await dashboard.handle_browser_command("resume_session")
+        await dashboard.handle_browser_command("stop_session")
+        assert len(dashboard._transcripts) == 0

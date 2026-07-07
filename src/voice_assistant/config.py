@@ -15,7 +15,8 @@ DEFAULT_OPENAI_VOICE = "alloy"
 DEFAULT_OPENING_GREETING_INSTRUCTIONS = (
     "Start with a warm, brief greeting in one or two short sentences. "
     "The listener just finished microphone setup — do not ask them to say hello. "
-    "Invite them to ask you a question or tell you something."
+    "Encourage them to start a fun, productive conversation: invite them to ask "
+    "you a question, share an idea, or tell you about something they're curious about."
 )
 DEFAULT_ASSISTANT_INSTRUCTIONS = (
     "You are a friendly voice assistant for children. "

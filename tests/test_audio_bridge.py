@@ -367,6 +367,63 @@ class TestAudioBridgeResume:
         assert not bridge._awaiting_calibration
 
 
+class TestCalibrationWatchdog:
+    async def test_repeats_prompt_while_awaiting_calibration(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("voice_assistant.audio.bridge.CALIBRATION_REPEAT_SEC", 0)
+        monkeypatch.setattr("voice_assistant.audio.bridge.CALIBRATION_TIMEOUT_SEC", 999)
+
+        bridge = AudioBridge(_make_mock_transport(), loopback=False)
+        bridge._awaiting_calibration = True
+        bridge._schedule_calibration_watchdog()
+
+        await asyncio.sleep(0.05)
+
+        assert bridge.conversation_state == "calibrating_retry"
+        bridge._cancel_calibration_watchdog()
+
+    async def test_gives_up_after_timeout(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("voice_assistant.audio.bridge.CALIBRATION_REPEAT_SEC", 0)
+        monkeypatch.setattr("voice_assistant.audio.bridge.CALIBRATION_TIMEOUT_SEC", 0)
+
+        bridge = AudioBridge(_make_mock_transport(), loopback=False)
+        bridge._awaiting_calibration = True
+        timed_out = False
+
+        def on_timeout() -> None:
+            nonlocal timed_out
+            timed_out = True
+
+        bridge.set_calibration_timeout_callback(on_timeout)
+        bridge._schedule_calibration_watchdog()
+
+        await asyncio.sleep(0.05)
+
+        assert timed_out
+
+    async def test_watchdog_stops_once_calibration_completes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("voice_assistant.audio.bridge.CALIBRATION_REPEAT_SEC", 0.01)
+        monkeypatch.setattr("voice_assistant.audio.bridge.CALIBRATION_TIMEOUT_SEC", 999)
+
+        bridge = AudioBridge(_make_mock_transport(), loopback=True)
+        bridge._awaiting_calibration = True
+        bridge._schedule_calibration_watchdog()
+
+        bridge._awaiting_calibration = False
+        await asyncio.sleep(0.03)
+
+        assert bridge.conversation_state != "calibrating_retry"
+        assert not bridge._awaiting_calibration
+
+
 class TestWholeChunkPlayback:
     async def test_single_play_audio_on_response_done(self) -> None:
         transport = _make_mock_transport()

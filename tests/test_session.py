@@ -106,7 +106,7 @@ class TestConversation:
         await sm.start_conversation()
         assert sm.state == SessionState.STREAMING
 
-    async def test_start_stop_start_skips_recalibration(self) -> None:
+    async def test_pause_then_resume_skips_recalibration(self) -> None:
         from unittest.mock import AsyncMock, patch
 
         import voice_assistant.openai_client.realtime as rt_mod
@@ -146,10 +146,12 @@ class TestConversation:
             await sm._process_message(cal_msg, 1)
             assert sm._calibration_metrics is not None
 
-            await sm.stop_conversation()
+            await sm.pause_conversation()
+            assert sm.state == SessionState.PAUSED
+            assert sm._calibration_metrics is not None
             mock_instance.disconnect.assert_called_once()
 
-            await sm.start_conversation()
+            await sm.resume_conversation()
             assert sm.state == SessionState.STREAMING
             assert sm._audio_bridge is not None
             assert sm._audio_bridge.conversation_state == "listening"
@@ -169,6 +171,51 @@ class TestConversation:
             )
             await sm._process_message(status_msg, 2)
             assert sm._audio_bridge.conversation_state == "listening"
+
+    async def test_stop_conversation_clears_calibration_metrics(self) -> None:
+        t = MockTransport()
+        sm = SessionManager(t)
+        await sm.wait_for_device()
+        await sm.start_conversation()
+        sm._calibration_metrics = {"noise_floor": 300.0, "user_speech_peak": 900.0}
+
+        await sm.stop_conversation()
+
+        assert sm._calibration_metrics is None
+
+        await sm.start_conversation()
+        start_msgs = [
+            m for m in t.sent_messages
+            if m.type.value == "START_AUDIO_STREAM"
+        ]
+        assert start_msgs[-1].payload is None
+
+    async def test_pause_requires_streaming(self) -> None:
+        t = MockTransport()
+        sm = SessionManager(t)
+        await sm.wait_for_device()
+        with pytest.raises(TransportError):
+            await sm.pause_conversation()
+
+    async def test_resume_requires_paused(self) -> None:
+        t = MockTransport()
+        sm = SessionManager(t)
+        await sm.wait_for_device()
+        await sm.start_conversation()
+        with pytest.raises(TransportError):
+            await sm.resume_conversation()
+
+    async def test_stop_allowed_while_paused(self) -> None:
+        t = MockTransport()
+        sm = SessionManager(t)
+        await sm.wait_for_device()
+        await sm.start_conversation()
+        await sm.pause_conversation()
+
+        await sm.stop_conversation()
+
+        assert sm.state == SessionState.ACTIVE
+        assert sm._calibration_metrics is None
 
     async def test_calibration_cache_cleared_on_disconnect(self) -> None:
         t = MockTransport()
@@ -231,6 +278,88 @@ class TestSessionShutdown:
         await sm.shutdown_device()
         await sm.shutdown_device()
         assert sm.state == SessionState.SHUTDOWN
+
+
+class TestTurnOn:
+    """turn_on() re-arms the app for a new handshake after shutdown."""
+
+    async def test_turn_on_reopens_device_server(self) -> None:
+        t = MockTransport()
+        sm = SessionManager(t)
+        await sm.wait_for_device()
+        await sm.shutdown_device()
+        assert sm.state == SessionState.SHUTDOWN
+
+        await sm.turn_on()
+
+        assert sm.state == SessionState.CONNECTING
+        assert not sm.handshake_complete
+        assert sm.session_id is None
+
+        await sm.stop_receive_loop()
+
+    async def test_turn_on_requires_shutdown(self) -> None:
+        t = MockTransport()
+        sm = SessionManager(t)
+        await sm.wait_for_device()
+        with pytest.raises(TransportError):
+            await sm.turn_on()
+
+    async def test_turn_on_can_complete_new_handshake(self) -> None:
+        t = MockTransport()
+        sm = SessionManager(t)
+        await sm.wait_for_device()
+        await sm.shutdown_device()
+
+        await sm.turn_on()
+        await sm.stop_receive_loop()
+        await sm._await_handshake()
+
+        assert sm.handshake_complete
+        assert sm.state == SessionState.ACTIVE
+
+
+class TestCalibrationTimeout:
+    """AudioBridge's calibration watchdog stops the session after a timeout."""
+
+    async def test_calibration_timeout_stops_session(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("voice_assistant.audio.bridge.CALIBRATION_REPEAT_SEC", 0.01)
+        monkeypatch.setattr("voice_assistant.audio.bridge.CALIBRATION_TIMEOUT_SEC", 0.01)
+
+        from unittest.mock import AsyncMock, patch
+
+        import voice_assistant.openai_client.realtime as rt_mod
+        from voice_assistant.config import Config
+
+        t = MockTransport()
+        sm = SessionManager(t, loopback=False, config=Config(openai_api_key="test-key"))
+        await sm.wait_for_device()
+
+        mock_instance = AsyncMock()
+        mock_instance.is_connected = True
+
+        async def fake_iter():
+            await asyncio.Event().wait()
+            return
+            yield
+
+        mock_instance.iter_events = fake_iter
+        mock_instance.connect = AsyncMock()
+
+        with patch.object(rt_mod, "RealtimeClient", return_value=mock_instance):
+            await sm.start_conversation()
+            assert sm.state == SessionState.STREAMING
+
+            for _ in range(50):
+                if sm.state != SessionState.STREAMING:
+                    break
+                await asyncio.sleep(0.02)
+
+        assert sm.state == SessionState.ACTIVE
+        assert sm._audio_bridge is None
 
 
 class TestReceiveLoop:

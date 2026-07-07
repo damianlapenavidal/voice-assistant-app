@@ -44,15 +44,10 @@ async def test_run_app_starts_web_server() -> None:
     session.run_session_loop = AsyncMock()
     order: list[str] = []
 
-    async def web_start(_session: object, _port: int) -> asyncio.Task[None]:
+    async def web_start(_session: object, _port: int, **_kwargs: object) -> None:
         order.append("web_start")
 
-        async def noop() -> None:
-            return None
-
-        return asyncio.create_task(noop())
-
-    with patch("voice_assistant.main._start_web_server", web_start):
+    with patch("voice_assistant.main._start_web_dashboard", web_start):
         run_task = asyncio.create_task(
             _run_app(
                 session,

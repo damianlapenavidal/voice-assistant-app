@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import socket
+import threading
+import time
 from functools import partial
 from typing import Any
 
@@ -81,21 +84,37 @@ def _warm_web_stack() -> None:
     import fastapi  # noqa: F401
 
 
-def _create_web_server(session: object, web_port: int) -> object:
-    """Build a uvicorn Server off the event loop."""
-    import uvicorn
+def _warn_if_slow(
+    future: asyncio.Future[Any],
+    event: str,
+    *,
+    after_sec: float = 5.0,
+) -> None:
+    """Log a warning if a background future is still pending after a delay.
 
-    from voice_assistant.web.app import create_app
+    Makes an otherwise-silent slow import (e.g. macOS scanning freshly
+    installed compiled packages on first run) visible in the logs instead of
+    looking like a hang.
+    """
 
-    app = create_app(session)
-    config = uvicorn.Config(
-        app,
-        host="0.0.0.0",
-        port=web_port,
-        log_level="warning",
-        loop="asyncio",
-    )
-    return uvicorn.Server(config)
+    async def _watch() -> None:
+        await asyncio.sleep(after_sec)
+        if not future.done():
+            log.warning(event, elapsed_s=_elapsed_s())
+
+    asyncio.create_task(_watch(), name=f"watchdog-{event}")
+
+
+def _wait_for_port(port: int, *, timeout_sec: float = 10.0) -> bool:
+    """Return True once something is listening on localhost:port."""
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.1)
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                return True
+        time.sleep(0.05)
+    return False
 
 
 def _build_session(
@@ -130,26 +149,34 @@ def _build_session(
     return session, True
 
 
-async def _wait_for_server_started(server: object, *, timeout_sec: float = 10.0) -> bool:
-    """Poll until uvicorn reports the socket is listening."""
-    polls = int(timeout_sec / 0.05)
-    for _ in range(polls):
-        if getattr(server, "started", False):
-            return True
-        await asyncio.sleep(0.05)
-    return False
+async def _start_web_dashboard(
+    session: object,
+    web_port: int,
+    *,
+    web_warm_future: asyncio.Future[Any] | None = None,
+) -> None:
+    """Start the dashboard on a dedicated thread (avoids WS conflicts on the main loop).
 
+    Waits for the (potentially slow) fastapi/uvicorn import to finish, but this
+    never blocks the device server — that path does not depend on this future.
+    """
+    if web_warm_future is not None:
+        await web_warm_future
 
-async def _start_web_server(session: object, web_port: int) -> asyncio.Task[None]:
-    """Start the FastAPI dashboard on the running asyncio event loop."""
-    log.info("web.dashboard_starting", port=web_port)
-    loop = asyncio.get_running_loop()
-    server = await loop.run_in_executor(None, _create_web_server, session, web_port)
-    task = asyncio.create_task(server.serve(), name="web-dashboard")
-    if not await _wait_for_server_started(server):
+    from voice_assistant.web.app import DashboardManager
+    from voice_assistant.web.server import start_web_server_thread
+
+    main_loop = asyncio.get_running_loop()
+    dashboard = DashboardManager(session, main_loop=main_loop)
+    ready = threading.Event()
+    start_web_server_thread(dashboard, web_port, ready=ready)
+
+    if not await asyncio.to_thread(ready.wait, 120):
+        log.warning("web.dashboard_thread_timeout", port=web_port)
+    if not await asyncio.to_thread(_wait_for_port, web_port, timeout_sec=10.0):
         log.warning("web.dashboard_bind_timeout", port=web_port)
+
     log.info("web.dashboard_started", port=web_port, url=f"http://localhost:{web_port}")
-    return task
 
 
 async def _start_device_server(session: object) -> None:
@@ -164,22 +191,27 @@ async def _run_app(
     device_mode: bool,
     web_enabled: bool,
     web_port: int,
+    web_warm_future: asyncio.Future[Any] | None = None,
 ) -> None:
-    """Run servers on a single asyncio event loop."""
-    web_task: asyncio.Task[None] | None = None
+    """Run the device server on the main loop; dashboard runs on its own thread.
+
+    The device server never waits on the dashboard (or its slow imports) --
+    a Pi can connect immediately even while the web stack is still loading.
+    """
     startup: list[asyncio.Task[Any]] = []
 
     if device_mode:
         startup.append(asyncio.create_task(_start_device_server(session), name="device-startup"))
     if web_enabled:
         startup.append(
-            asyncio.create_task(_start_web_server(session, web_port), name="web-startup"),
+            asyncio.create_task(
+                _start_web_dashboard(session, web_port, web_warm_future=web_warm_future),
+                name="web-startup",
+            ),
         )
 
     if startup:
-        results = await asyncio.gather(*startup)
-        if web_enabled:
-            web_task = results[-1] if device_mode else results[0]
+        await asyncio.gather(*startup)
 
     try:
         if device_mode:
@@ -192,12 +224,6 @@ async def _run_app(
         if device_mode:
             await session.stop_receive_loop()
             await session.shutdown_device()
-        if web_task is not None:
-            web_task.cancel()
-            try:
-                await web_task
-            except asyncio.CancelledError:
-                pass
 
 
 async def _main_async(
@@ -218,21 +244,23 @@ async def _main_async(
     )
 
     loop = asyncio.get_running_loop()
-    load_tasks: list[asyncio.Future[Any]] = [
-        loop.run_in_executor(
-            None,
-            partial(_build_session, config, use_loopback=use_loopback),
-        ),
-    ]
+
+    # Kick off the (potentially slow, e.g. first-run OS security scanning of
+    # newly installed packages) fastapi/uvicorn import in the background, but
+    # do NOT gate the device server on it -- a Pi should be able to connect
+    # the moment the (fast) session build finishes, regardless of how long
+    # the web stack takes to warm up.
+    web_warm_future: asyncio.Future[Any] | None = None
     if config.web_enabled:
         log.info("web.loading_dependencies")
-        load_tasks.append(loop.run_in_executor(None, _warm_web_stack))
+        web_warm_future = loop.run_in_executor(None, _warm_web_stack)
+        _warn_if_slow(web_warm_future, "web.dependencies_still_loading")
 
     log.info("app.loading_modules", elapsed_s=_elapsed_s())
-    results = await asyncio.gather(*load_tasks)
-    session, device_mode = results[0]
-    if config.web_enabled:
-        log.info("web.dependencies_ready", elapsed_s=_elapsed_s())
+    session, device_mode = await loop.run_in_executor(
+        None,
+        partial(_build_session, config, use_loopback=use_loopback),
+    )
     log.info("app.modules_ready", elapsed_s=_elapsed_s())
 
     if config.openai_api_key and not force_loopback and not use_loopback:
@@ -246,6 +274,7 @@ async def _main_async(
         device_mode=device_mode,
         web_enabled=config.web_enabled,
         web_port=config.web_port,
+        web_warm_future=web_warm_future,
     )
 
 

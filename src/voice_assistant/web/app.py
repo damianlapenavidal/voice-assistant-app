@@ -1,7 +1,5 @@
 """FastAPI web dashboard for controlling voice assistant sessions."""
 
-from __future__ import annotations
-
 import asyncio
 import json
 from collections import deque
@@ -24,9 +22,16 @@ STATIC_DIR = Path(__file__).parent / "static"
 class DashboardManager:
     """Bridges SessionManager events to browser WebSocket clients."""
 
-    def __init__(self, session_manager: SessionManager) -> None:
+    def __init__(
+        self,
+        session_manager: SessionManager,
+        *,
+        main_loop: asyncio.AbstractEventLoop,
+    ) -> None:
         self._session_manager = session_manager
-        self._browser_clients: list[WebSocket] = []
+        self._main_loop = main_loop
+        self._web_loop: asyncio.AbstractEventLoop | None = None
+        self._browser_clients: list["WebSocket"] = []
         self._message_log: deque[dict[str, Any]] = deque(maxlen=100)
         self._device_info: dict[str, Any] = {}
         self._device_status: dict[str, Any] = {}
@@ -35,8 +40,12 @@ class DashboardManager:
         self._mic_muted = False
         session_manager.add_event_listener(self._on_session_event)
 
+    def set_web_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Set the dashboard asyncio loop (runs in the web server thread)."""
+        self._web_loop = loop
+
     def _on_session_event(self, event: str, data: dict[str, Any]) -> None:
-        """Handle events from SessionManager."""
+        """Handle events from SessionManager (called on the main event loop)."""
         if event == "session_started":
             self._device_info = data.get("device_info") or {}
         elif event == "device_status":
@@ -49,6 +58,7 @@ class DashboardManager:
             self._device_status = {}
         elif event == "conversation_stopped":
             self._mic_muted = False
+            self._transcripts.clear()
         elif event == "mic_muted":
             self._mic_muted = data.get("muted", False)
         elif event == "transcript":
@@ -68,12 +78,11 @@ class DashboardManager:
         self._schedule_broadcast(entry)
 
     def _schedule_broadcast(self, entry: dict[str, Any]) -> None:
-        """Schedule a broadcast on the running event loop (same loop as SessionManager)."""
+        """Forward a broadcast to the web server thread."""
+        if self._web_loop is None or self._web_loop.is_closed():
+            return
         try:
-            asyncio.get_running_loop().create_task(
-                self._broadcast(entry),
-                name="dashboard-broadcast",
-            )
+            asyncio.run_coroutine_threadsafe(self._broadcast(entry), self._web_loop)
         except RuntimeError:
             log.warning(
                 "dashboard.broadcast_skipped_no_loop",
@@ -83,7 +92,7 @@ class DashboardManager:
     async def _broadcast(self, data: dict[str, Any]) -> None:
         """Send data to all connected browser clients."""
         payload = json.dumps(data)
-        disconnected: list[WebSocket] = []
+        disconnected: list["WebSocket"] = []
         for ws in self._browser_clients:
             try:
                 await ws.send_text(payload)
@@ -92,14 +101,14 @@ class DashboardManager:
         for ws in disconnected:
             self._browser_clients.remove(ws)
 
-    async def register_browser(self, ws: WebSocket) -> None:
+    async def register_browser(self, ws: "WebSocket") -> None:
         await ws.accept()
         self._browser_clients.append(ws)
         log.info("dashboard.browser_connected", total=len(self._browser_clients))
 
         await ws.send_text(json.dumps(self._get_full_state()))
 
-    def unregister_browser(self, ws: WebSocket) -> None:
+    def unregister_browser(self, ws: "WebSocket") -> None:
         if ws in self._browser_clients:
             self._browser_clients.remove(ws)
         log.info("dashboard.browser_disconnected", total=len(self._browser_clients))
@@ -127,7 +136,15 @@ class DashboardManager:
         }
 
     async def handle_browser_command(self, action: str) -> dict[str, str]:
-        """Execute a command from the browser dashboard."""
+        """Execute a command from the browser dashboard (web thread -> main loop)."""
+        future = asyncio.run_coroutine_threadsafe(
+            self._handle_browser_command_main(action),
+            self._main_loop,
+        )
+        return await asyncio.wrap_future(future)
+
+    async def _handle_browser_command_main(self, action: str) -> dict[str, str]:
+        """Run dashboard commands on the main session event loop."""
         sm = self._session_manager
         try:
             match action:
@@ -141,14 +158,35 @@ class DashboardManager:
                         await sm.start_conversation()
                         return {"status": "ok", "message": "Conversation started"}
                     return {"status": "error", "message": f"Cannot start: state is {sm.state.name}"}
-                case "stop_session":
+                case "pause_session":
                     if sm.state == SessionState.STREAMING:
+                        await sm.pause_conversation()
+                        return {"status": "ok", "message": "Conversation paused"}
+                    return {"status": "error", "message": f"Cannot pause: state is {sm.state.name}"}
+                case "resume_session":
+                    if sm.state == SessionState.PAUSED:
+                        await sm.resume_conversation()
+                        return {"status": "ok", "message": "Conversation resumed"}
+                    return {"status": "error", "message": f"Cannot resume: state is {sm.state.name}"}
+                case "stop_session":
+                    if sm.state in (SessionState.STREAMING, SessionState.PAUSED):
                         await sm.stop_conversation()
                         return {"status": "ok", "message": "Conversation stopped"}
                     return {"status": "error", "message": f"Cannot stop: state is {sm.state.name}"}
                 case "shutdown":
                     await sm.shutdown_device()
                     return {"status": "ok", "message": "Device shutdown sent"}
+                case "turn_on":
+                    if sm.state == SessionState.SHUTDOWN:
+                        await sm.turn_on()
+                        return {
+                            "status": "ok",
+                            "message": (
+                                "Waiting for device to reconnect "
+                                "(remote power-on is not automated yet)"
+                            ),
+                        }
+                    return {"status": "error", "message": f"Cannot turn on: state is {sm.state.name}"}
                 case _:
                     return {"status": "error", "message": f"Unknown action: {action}"}
         except Exception as exc:
@@ -156,13 +194,12 @@ class DashboardManager:
             return {"status": "error", "message": str(exc)}
 
 
-def create_app(session_manager: SessionManager) -> FastAPI:
+def create_app(dashboard: DashboardManager) -> "FastAPI":
     """Create the FastAPI dashboard app."""
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
     from fastapi.responses import HTMLResponse
 
     app = FastAPI(title="Voice Assistant Dashboard")
-    dashboard = DashboardManager(session_manager)
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:

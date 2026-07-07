@@ -169,6 +169,7 @@
   .conv-dot.processing { background: var(--yellow); animation: pulse 1s ease-in-out infinite; }
   .conv-dot.ai_speaking { background: var(--blue); animation: pulse 0.8s ease-in-out infinite; }
   .conv-dot.loopback { background: var(--yellow); animation: pulse 2s ease-in-out infinite; }
+  .conv-dot.paused { background: var(--text-dim); }
 
   @keyframes pulse {
     0%, 100% { opacity: 1; transform: scale(1); }
@@ -196,10 +197,15 @@
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .btn-start { background: var(--accent); color: #fff; }
   .btn-start:hover:not(:disabled) { background: var(--accent-hover); }
+  .btn-pause, .btn-resume { background: var(--surface2); color: var(--blue); border: 1px solid var(--border); }
+  .btn-pause:hover:not(:disabled), .btn-resume:hover:not(:disabled) { background: var(--border); }
   .btn-stop { background: var(--surface2); color: var(--yellow); border: 1px solid var(--border); }
   .btn-stop:hover:not(:disabled) { background: var(--border); }
   .btn-shutdown { background: var(--surface2); color: var(--red); border: 1px solid var(--border); }
   .btn-shutdown:hover:not(:disabled) { background: var(--border); }
+  .btn-turnon { background: var(--green); color: #06281d; }
+  .btn-turnon:hover:not(:disabled) { opacity: 0.9; }
+  .btn[hidden] { display: none; }
 
   .transcript-area {
     max-height: 260px;
@@ -348,7 +354,10 @@
   <div class="card">
     <div class="card-title">Controls</div>
     <div class="controls">
+      <button class="btn btn-turnon" id="btnTurnOn" onclick="sendAction('turn_on')" hidden>Turn On</button>
       <button class="btn btn-start" id="btnStart" onclick="sendAction('start_session')">Start Session</button>
+      <button class="btn btn-pause" id="btnPause" onclick="sendAction('pause_session')">Pause</button>
+      <button class="btn btn-resume" id="btnResume" onclick="sendAction('resume_session')" hidden>Resume</button>
       <button class="btn btn-stop" id="btnStop" onclick="sendAction('stop_session')">Stop Session</button>
       <button class="btn btn-shutdown" id="btnShutdown" onclick="sendAction('shutdown')">Shutdown</button>
     </div>
@@ -446,6 +455,9 @@
       updateConversationState(data.state || 'idle');
     } else if (event === 'calibration_complete') {
       // State transitions are driven by conversation_state events.
+    } else if (event === 'conversation_paused') {
+      updateSessionState('PAUSED');
+      updateConversationState('paused');
     } else if (event === 'conversation_stopped') {
       updateSessionState('ACTIVE');
       updateConversationState('idle');
@@ -453,6 +465,9 @@
     } else if (event === 'session_shutdown' || event === 'device_disconnected') {
       updateConnectionStatus(false);
       updateSessionState(event === 'session_shutdown' ? 'SHUTDOWN' : 'IDLE');
+      updateConversationState('idle');
+    } else if (event === 'device_turning_on') {
+      updateSessionState('CONNECTING');
       updateConversationState('idle');
     } else if (event === 'device_status') {
       updateDeviceStatus(data);
@@ -482,9 +497,18 @@
   }
 
   function updateButtonStates(state) {
+    document.getElementById('btnTurnOn').hidden = state !== 'SHUTDOWN';
+    document.getElementById('btnTurnOn').disabled = state !== 'SHUTDOWN';
+
     document.getElementById('btnStart').disabled = state !== 'ACTIVE';
-    document.getElementById('btnStop').disabled = state !== 'STREAMING';
-    document.getElementById('btnShutdown').disabled = !['ACTIVE', 'STREAMING'].includes(state);
+
+    document.getElementById('btnPause').hidden = state === 'PAUSED';
+    document.getElementById('btnPause').disabled = state !== 'STREAMING';
+    document.getElementById('btnResume').hidden = state !== 'PAUSED';
+    document.getElementById('btnResume').disabled = state !== 'PAUSED';
+
+    document.getElementById('btnStop').disabled = !['STREAMING', 'PAUSED'].includes(state);
+    document.getElementById('btnShutdown').disabled = !['ACTIVE', 'STREAMING', 'PAUSED'].includes(state);
   }
 
   function updateConnectionStatus(connected) {
@@ -561,6 +585,7 @@
       processing: 'Processing…',
       ai_speaking: 'AI Speaking',
       loopback: 'Loopback Active',
+      paused: 'Paused',
     };
     text.textContent = labels[state] || state;
   }

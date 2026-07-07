@@ -10,6 +10,8 @@ from typing import Any
 import structlog
 
 from voice_assistant.audio.utils import (
+    CALIBRATION_REPEAT_SEC,
+    CALIBRATION_TIMEOUT_SEC,
     OPENING_NUDGE_WAIT_SEC,
     PLAY_AUDIO_CHUNK_BYTES,
     base64_to_pcm16,
@@ -36,6 +38,7 @@ STARTUP_RESPONSE_TIMEOUT_SEC = 15.0
 TranscriptCallback = Callable[[str, str, bool], None]
 MicMuteCallback = Callable[[bool], None]
 ConversationStateCallback = Callable[[str], None]
+CalibrationTimeoutCallback = Callable[[], None]
 
 
 class AudioBridge:
@@ -71,6 +74,8 @@ class AudioBridge:
         self._awaiting_calibration = False
         self._calibration_phase: str | None = None
         self._awaiting_opening_greeting = False
+        self._calibration_watchdog_task: asyncio.Task[None] | None = None
+        self._calibration_timeout_callback: CalibrationTimeoutCallback | None = None
 
         self._audio_buffer = bytearray()
         self._audio_seq = 0
@@ -132,6 +137,12 @@ class AudioBridge:
     def set_transcript_callback(self, callback: TranscriptCallback | None) -> None:
         self._transcript_callback = callback
 
+    def set_calibration_timeout_callback(
+        self,
+        callback: CalibrationTimeoutCallback | None,
+    ) -> None:
+        self._calibration_timeout_callback = callback
+
     def set_mic_mute_callback(self, callback: MicMuteCallback | None) -> None:
         self._mic_mute_callback = callback
 
@@ -180,6 +191,45 @@ class AudioBridge:
         if self._opening_nudge_task is not None:
             self._opening_nudge_task.cancel()
             self._opening_nudge_task = None
+
+    def _cancel_calibration_watchdog(self) -> None:
+        if self._calibration_watchdog_task is not None:
+            self._calibration_watchdog_task.cancel()
+            self._calibration_watchdog_task = None
+
+    def _schedule_calibration_watchdog(self) -> None:
+        """Re-prompt for the calibration hello every CALIBRATION_REPEAT_SEC;
+        give up and signal a timeout after CALIBRATION_TIMEOUT_SEC of silence."""
+        self._cancel_calibration_watchdog()
+
+        async def _watch() -> None:
+            elapsed = 0.0
+            try:
+                while self._awaiting_calibration:
+                    await asyncio.sleep(CALIBRATION_REPEAT_SEC)
+                    if not self._awaiting_calibration:
+                        return
+                    elapsed += CALIBRATION_REPEAT_SEC
+                    if elapsed >= CALIBRATION_TIMEOUT_SEC:
+                        log.warning(
+                            "audio_bridge.calibration_timeout",
+                            elapsed_sec=elapsed,
+                        )
+                        if self._calibration_timeout_callback is not None:
+                            self._calibration_timeout_callback()
+                        return
+                    log.info(
+                        "audio_bridge.calibration_prompt_repeat",
+                        elapsed_sec=elapsed,
+                    )
+                    self._set_conversation_state("calibrating_retry")
+            except asyncio.CancelledError:
+                raise
+
+        self._calibration_watchdog_task = asyncio.create_task(
+            _watch(),
+            name="audio-bridge-calibration-watchdog",
+        )
 
     def _arm_conversation(self) -> None:
         if self._conversation_armed:
@@ -277,6 +327,7 @@ class AudioBridge:
         if not self._loopback:
             self._awaiting_calibration = True
             log.info("audio_bridge.awaiting_calibration")
+            self._schedule_calibration_watchdog()
             self._realtime_connect_task = asyncio.create_task(
                 self._early_realtime_connect(),
                 name="audio-bridge-realtime-connect",
@@ -332,6 +383,7 @@ class AudioBridge:
         self._reset_opening_phase()
         self._reset_transcript_ordering()
         self._reset_calibration_hello_state()
+        self._cancel_calibration_watchdog()
         log.info(
             "audio_bridge.stopped",
             frames_processed=self._frame_count,
@@ -342,6 +394,7 @@ class AudioBridge:
         self._cancel_unmute_timeout()
         self._cancel_opening_nudge_task()
         self._cancel_startup_response_timeout()
+        self._cancel_calibration_watchdog()
         if self._mic_muted and self._device_ready:
             await self._send_mute(False)
         self.stop()
@@ -362,6 +415,7 @@ class AudioBridge:
         self._session_ready = False
         self._cancel_realtime_connect_task()
         self._reset_opening_phase()
+        self._cancel_calibration_watchdog()
         async with self._buffer_lock:
             self._audio_buffer.clear()
         await self._disconnect_realtime()
@@ -562,6 +616,7 @@ class AudioBridge:
 
         self._calibration_phase = None
         self._awaiting_calibration = False
+        self._cancel_calibration_watchdog()
 
         if not self._loopback:
             self._set_conversation_state("connecting_openai")

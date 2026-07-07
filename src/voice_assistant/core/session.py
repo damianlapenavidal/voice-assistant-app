@@ -31,6 +31,7 @@ class SessionState(Enum):
     CONNECTING = auto()
     ACTIVE = auto()
     STREAMING = auto()
+    PAUSED = auto()
     SHUTDOWN = auto()
 
 
@@ -181,6 +182,7 @@ class SessionManager:
         self._audio_bridge.set_transcript_callback(self._on_transcript)
         self._audio_bridge.set_mic_mute_callback(self._on_mic_mute)
         self._audio_bridge.set_conversation_state_callback(self._on_conversation_state)
+        self._audio_bridge.set_calibration_timeout_callback(self._on_calibration_timeout)
         self._audio_bridge.set_device_ready(True)
 
         if use_loopback:
@@ -209,9 +211,50 @@ class SessionManager:
             "resumed": resuming,
         })
 
-    async def stop_conversation(self) -> None:
-        """Send STOP_AUDIO_STREAM and return to ACTIVE."""
+    async def pause_conversation(self) -> None:
+        """Suspend the conversation but keep calibration cached for a fast resume.
+
+        Unlike stop_conversation(), the cached calibration metrics are kept,
+        so resume_conversation() can skip re-calibration entirely. The device
+        handshake and any conversation transcripts stay untouched.
+        """
         if self._state != SessionState.STREAMING:
+            raise TransportError(f"Cannot pause in state {self._state.name}")
+
+        if self._audio_bridge is not None:
+            if self._audio_bridge.loopback:
+                self._audio_bridge.stop()
+            else:
+                await self._audio_bridge.stop_async()
+            self._audio_bridge.set_device_ready(False)
+            self._audio_bridge = None
+            msg = create_message(MessageType.STOP_AUDIO_STREAM)
+            await self._transport.send_message(msg)
+
+        self._state = SessionState.PAUSED
+        log.info("session.conversation_paused", session_id=self._session_id)
+        self._emit("conversation_paused", {"session_id": self._session_id})
+
+    async def resume_conversation(self) -> None:
+        """Resume a paused conversation, reusing cached calibration.
+
+        Delegates to start_conversation(), which already emits
+        "conversation_started" with resumed=True when calibration is cached.
+        """
+        if self._state != SessionState.PAUSED:
+            raise TransportError(f"Cannot resume in state {self._state.name}")
+
+        self._state = SessionState.ACTIVE
+        await self.start_conversation()
+
+    async def stop_conversation(self) -> None:
+        """Send STOP_AUDIO_STREAM, clear cached calibration, and return to ACTIVE.
+
+        Unlike pause_conversation(), this clears the cached calibration
+        metrics ("topics" and voice levels) -- the next start_conversation()
+        will re-calibrate from scratch. The device handshake is preserved.
+        """
+        if self._state not in (SessionState.STREAMING, SessionState.PAUSED):
             raise TransportError(f"Cannot stop conversation in state {self._state.name}")
 
         if self._audio_bridge is not None:
@@ -221,12 +264,30 @@ class SessionManager:
                 await self._audio_bridge.stop_async()
             self._audio_bridge.set_device_ready(False)
             self._audio_bridge = None
+            msg = create_message(MessageType.STOP_AUDIO_STREAM)
+            await self._transport.send_message(msg)
 
-        msg = create_message(MessageType.STOP_AUDIO_STREAM)
-        await self._transport.send_message(msg)
+        self._calibration_metrics = None
         self._state = SessionState.ACTIVE
         log.info("session.conversation_stopped", session_id=self._session_id)
         self._emit("conversation_stopped", {"session_id": self._session_id})
+
+    def _on_calibration_timeout(self) -> None:
+        """Called from AudioBridge (sync context) when calibration gives up."""
+        asyncio.create_task(
+            self._handle_calibration_timeout(),
+            name="session-calibration-timeout",
+        )
+
+    async def _handle_calibration_timeout(self) -> None:
+        """No valid 'hello' within CALIBRATION_TIMEOUT_SEC -- stop the session."""
+        log.warning("session.calibration_timeout", session_id=self._session_id)
+        self._emit("calibration_timeout", {"session_id": self._session_id})
+        if self._state == SessionState.STREAMING:
+            try:
+                await self.stop_conversation()
+            except TransportError:
+                pass
 
     def _on_transcript(self, role: str, text: str, final: bool) -> None:
         self._emit("transcript", {"role": role, "text": text, "final": final})
@@ -253,6 +314,25 @@ class SessionManager:
         self._state = SessionState.SHUTDOWN
         log.info("session.shutdown", session_id=self._session_id)
         self._emit("session_shutdown", {"session_id": self._session_id})
+
+    async def turn_on(self) -> None:
+        """Re-arm the app after a shutdown so a device can reconnect.
+
+        This only reopens the app's own device server and receive loop --
+        it does not control the device's physical power. Waking an actually
+        powered-off Pi requires separate hardware support (e.g. Wake-on-LAN)
+        that is not wired up yet.
+        """
+        if self._state != SessionState.SHUTDOWN:
+            raise TransportError(f"Cannot turn on in state {self._state.name}")
+
+        self._handshake_complete = False
+        self._session_id = None
+        self._calibration_metrics = None
+        await self.start_device_server()
+        self.start_receive_loop()
+        log.info("session.turning_on")
+        self._emit("device_turning_on", {})
 
     def start_receive_loop(self) -> None:
         """Start the background message receive loop."""

@@ -17,6 +17,9 @@ PLAY_AUDIO_CHUNK_BYTES = 4800
 
 MIN_MEANINGFUL_USER_CHARS = 2
 OPENING_NUDGE_WAIT_SEC = 60
+# Calibration ("say hello") watchdog: re-prompt every minute, give up after 5.
+CALIBRATION_REPEAT_SEC = 60
+CALIBRATION_TIMEOUT_SEC = 300
 CALIBRATION_PROMPT_PHRASES = (
     "say hello to start",
     "say hello",
