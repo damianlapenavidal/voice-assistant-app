@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-assistant-app"
+version = "0.1.0"
+description = "Voice assistant app - the brain of a Raspberry Pi voice assistant for kids"
+requires-python = ">=3.11"
+dependencies = [
+    "websockets>=15.0",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "structlog>=24.0",
+    "certifi>=2024.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+voice-assistant = "voice_assistant.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

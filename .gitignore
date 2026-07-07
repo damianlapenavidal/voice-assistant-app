@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+
+# Environment variables
+.env
+
+# Testing / type checking
+.pytest_cache/
+.mypy_cache/
+
+# IDEs
+.idea/
+.vscode/
+
+# OS
+*.DS_Store

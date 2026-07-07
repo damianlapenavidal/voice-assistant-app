@@ -1,0 +1,198 @@
+"""FastAPI web dashboard for controlling voice assistant sessions."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import structlog
+
+from voice_assistant.core.session import SessionManager, SessionState
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI, WebSocket
+
+log = structlog.get_logger()
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+class DashboardManager:
+    """Bridges SessionManager events to browser WebSocket clients."""
+
+    def __init__(self, session_manager: SessionManager) -> None:
+        self._session_manager = session_manager
+        self._browser_clients: list[WebSocket] = []
+        self._message_log: deque[dict[str, Any]] = deque(maxlen=100)
+        self._device_info: dict[str, Any] = {}
+        self._device_status: dict[str, Any] = {}
+        self._transcripts: deque[dict[str, Any]] = deque(maxlen=50)
+
+        self._mic_muted = False
+        session_manager.add_event_listener(self._on_session_event)
+
+    def _on_session_event(self, event: str, data: dict[str, Any]) -> None:
+        """Handle events from SessionManager."""
+        if event == "session_started":
+            self._device_info = data.get("device_info") or {}
+        elif event == "device_status":
+            self._device_status = data
+        elif event == "device_disconnected":
+            self._device_info = {}
+            self._device_status = {}
+        elif event == "session_shutdown":
+            self._device_info = {}
+            self._device_status = {}
+        elif event == "conversation_stopped":
+            self._mic_muted = False
+        elif event == "mic_muted":
+            self._mic_muted = data.get("muted", False)
+        elif event == "transcript":
+            self._transcripts.append({
+                "role": data.get("role", ""),
+                "text": data.get("text", ""),
+                "final": data.get("final", False),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+        entry = {
+            "event": event,
+            "data": data,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._message_log.append(entry)
+        self._schedule_broadcast(entry)
+
+    def _schedule_broadcast(self, entry: dict[str, Any]) -> None:
+        """Schedule a broadcast on the running event loop (same loop as SessionManager)."""
+        try:
+            asyncio.get_running_loop().create_task(
+                self._broadcast(entry),
+                name="dashboard-broadcast",
+            )
+        except RuntimeError:
+            log.warning(
+                "dashboard.broadcast_skipped_no_loop",
+                event=entry.get("event"),
+            )
+
+    async def _broadcast(self, data: dict[str, Any]) -> None:
+        """Send data to all connected browser clients."""
+        payload = json.dumps(data)
+        disconnected: list[WebSocket] = []
+        for ws in self._browser_clients:
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                disconnected.append(ws)
+        for ws in disconnected:
+            self._browser_clients.remove(ws)
+
+    async def register_browser(self, ws: WebSocket) -> None:
+        await ws.accept()
+        self._browser_clients.append(ws)
+        log.info("dashboard.browser_connected", total=len(self._browser_clients))
+
+        await ws.send_text(json.dumps(self._get_full_state()))
+
+    def unregister_browser(self, ws: WebSocket) -> None:
+        if ws in self._browser_clients:
+            self._browser_clients.remove(ws)
+        log.info("dashboard.browser_disconnected", total=len(self._browser_clients))
+
+    def _get_full_state(self) -> dict[str, Any]:
+        sm = self._session_manager
+        transport = sm.transport
+        return {
+            "event": "full_state",
+            "data": {
+                "session_state": sm.state.name,
+                "session_id": sm.session_id,
+                "handshake_complete": sm.handshake_complete,
+                "device_connected": transport.is_connected,
+                "device_info": self._device_info,
+                "device_status": self._device_status,
+                "recent_messages": list(self._message_log),
+                "api_key_configured": sm.is_openai_configured,
+                "audio_mode": sm.active_mode,
+                "conversation_state": sm.conversation_state,
+                "mic_muted": self._mic_muted,
+                "transcripts": list(self._transcripts),
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    async def handle_browser_command(self, action: str) -> dict[str, str]:
+        """Execute a command from the browser dashboard."""
+        sm = self._session_manager
+        try:
+            match action:
+                case "start_session":
+                    if not sm.handshake_complete:
+                        return {
+                            "status": "error",
+                            "message": "Waiting for device handshake (HELLO_ACK)",
+                        }
+                    if sm.state == SessionState.ACTIVE:
+                        await sm.start_conversation()
+                        return {"status": "ok", "message": "Conversation started"}
+                    return {"status": "error", "message": f"Cannot start: state is {sm.state.name}"}
+                case "stop_session":
+                    if sm.state == SessionState.STREAMING:
+                        await sm.stop_conversation()
+                        return {"status": "ok", "message": "Conversation stopped"}
+                    return {"status": "error", "message": f"Cannot stop: state is {sm.state.name}"}
+                case "shutdown":
+                    await sm.shutdown_device()
+                    return {"status": "ok", "message": "Device shutdown sent"}
+                case _:
+                    return {"status": "error", "message": f"Unknown action: {action}"}
+        except Exception as exc:
+            log.error("dashboard.command_error", action=action, error=str(exc))
+            return {"status": "error", "message": str(exc)}
+
+
+def create_app(session_manager: SessionManager) -> FastAPI:
+    """Create the FastAPI dashboard app."""
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi.responses import HTMLResponse
+
+    app = FastAPI(title="Voice Assistant Dashboard")
+    dashboard = DashboardManager(session_manager)
+
+    @app.get("/", response_class=HTMLResponse)
+    async def index() -> HTMLResponse:
+        html_path = STATIC_DIR / "index.html"
+        return HTMLResponse(content=html_path.read_text())
+
+    @app.websocket("/ws")
+    async def websocket_endpoint(ws: WebSocket) -> None:
+        await dashboard.register_browser(ws)
+        try:
+            while True:
+                raw = await ws.receive_text()
+                try:
+                    cmd = json.loads(raw)
+                    action = cmd.get("action", "")
+                    result = await dashboard.handle_browser_command(action)
+                    await ws.send_text(json.dumps({
+                        "event": "command_result",
+                        "data": result,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }))
+                except json.JSONDecodeError:
+                    await ws.send_text(json.dumps({
+                        "event": "command_result",
+                        "data": {"status": "error", "message": "Invalid JSON"},
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }))
+        except WebSocketDisconnect:
+            pass
+        finally:
+            dashboard.unregister_browser(ws)
+
+    return app

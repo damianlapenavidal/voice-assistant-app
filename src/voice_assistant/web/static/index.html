@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voice Assistant Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #242836;
+    --border: #2e3344;
+    --text: #e4e6f0;
+    --text-dim: #8b8fa3;
+    --accent: #6c63ff;
+    --accent-hover: #7f78ff;
+    --green: #34d399;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --blue: #60a5fa;
+    --radius: 12px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 16px;
+  }
+
+  .container { max-width: 720px; margin: 0 auto; }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 0 24px;
+  }
+
+  header h1 { font-size: 1.3rem; font-weight: 600; }
+
+  .status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    background: var(--surface2);
+  }
+
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--red);
+  }
+
+  .status-dot.connected { background: var(--green); }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+
+  .card-title {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 12px;
+  }
+
+  .device-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+  }
+
+  .stat {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 12px;
+  }
+
+  .stat-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+
+  .stat-value { font-size: 1.1rem; font-weight: 600; }
+
+  .mode-bar {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+
+  .mode-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-size: 0.78rem;
+    font-weight: 500;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+  }
+
+  .mode-chip .chip-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+  }
+
+  .conversation-indicator {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 16px;
+    border-radius: 10px;
+    background: var(--surface2);
+    margin-bottom: 16px;
+    font-size: 0.95rem;
+    font-weight: 500;
+  }
+
+  .mic-badge {
+    margin-left: auto;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    display: none;
+  }
+
+  .mic-badge.muted {
+    display: inline-block;
+    background: rgba(248, 113, 113, 0.18);
+    color: var(--red);
+  }
+
+  .conv-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .conv-dot.idle { background: var(--text-dim); }
+  .conv-dot.listening { background: var(--green); animation: pulse 1.5s ease-in-out infinite; }
+  .conv-dot.calibrating, .conv-dot.calibrating_quiet, .conv-dot.calibrating_prompt,
+  .conv-dot.calibrating_speak, .conv-dot.calibrating_retry {
+    background: var(--yellow); animation: pulse 1.2s ease-in-out infinite;
+  }
+  .conv-dot.greeting { background: var(--blue); animation: pulse 1s ease-in-out infinite; }
+  .conv-dot.waiting_for_kid { background: var(--green); animation: pulse 2s ease-in-out infinite; }
+  .conv-dot.connecting_openai { background: var(--blue); animation: pulse 1.2s ease-in-out infinite; }
+  .conv-dot.connecting_openai_failed { background: var(--red); }
+  .conv-dot.user_speaking { background: var(--green); animation: pulse 0.6s ease-in-out infinite; }
+  .conv-dot.processing { background: var(--yellow); animation: pulse 1s ease-in-out infinite; }
+  .conv-dot.ai_speaking { background: var(--blue); animation: pulse 0.8s ease-in-out infinite; }
+  .conv-dot.loopback { background: var(--yellow); animation: pulse 2s ease-in-out infinite; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(1.3); }
+  }
+
+  .controls {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .btn {
+    flex: 1;
+    min-width: 120px;
+    padding: 12px 16px;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s, opacity 0.15s;
+  }
+
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-start { background: var(--accent); color: #fff; }
+  .btn-start:hover:not(:disabled) { background: var(--accent-hover); }
+  .btn-stop { background: var(--surface2); color: var(--yellow); border: 1px solid var(--border); }
+  .btn-stop:hover:not(:disabled) { background: var(--border); }
+  .btn-shutdown { background: var(--surface2); color: var(--red); border: 1px solid var(--border); }
+  .btn-shutdown:hover:not(:disabled) { background: var(--border); }
+
+  .transcript-area {
+    max-height: 260px;
+    overflow-y: auto;
+    font-size: 0.88rem;
+    line-height: 1.7;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .transcript-entry {
+    padding: 8px 12px;
+    border-radius: 8px;
+    margin-bottom: 6px;
+    max-width: 85%;
+  }
+
+  .transcript-entry.user {
+    background: var(--surface2);
+    align-self: flex-start;
+    border-left: 3px solid var(--green);
+  }
+
+  .transcript-entry.assistant {
+    background: rgba(108, 99, 255, 0.12);
+    align-self: flex-end;
+    border-right: 3px solid var(--accent);
+    margin-left: auto;
+  }
+
+  .transcript-role {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 600;
+    margin-right: 6px;
+  }
+
+  .transcript-role.user { color: var(--green); }
+  .transcript-role.assistant { color: var(--accent); }
+
+  .transcript-entry.assistant.streaming {
+    opacity: 0.85;
+  }
+
+  .transcript-empty {
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    text-align: center;
+    padding: 20px;
+  }
+
+  .log-area {
+    max-height: 260px;
+    overflow-y: auto;
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.78rem;
+    line-height: 1.6;
+  }
+
+  .log-entry {
+    padding: 4px 8px;
+    border-radius: 4px;
+    word-break: break-all;
+  }
+
+  .log-entry:nth-child(even) { background: var(--surface2); }
+
+  .log-time { color: var(--text-dim); margin-right: 8px; }
+  .log-event { color: var(--accent); font-weight: 500; margin-right: 6px; }
+  .log-error { color: var(--red); }
+  .log-ok { color: var(--green); }
+
+  .ws-status {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    text-align: center;
+    padding: 8px;
+  }
+
+  @media (max-width: 480px) {
+    .device-grid { grid-template-columns: 1fr; }
+    .controls { flex-direction: column; }
+    .btn { min-width: 100%; }
+    .mode-bar { flex-direction: column; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Voice Assistant</h1>
+    <span class="status-badge">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="statusText">Disconnected</span>
+    </span>
+  </header>
+
+  <div class="mode-bar">
+    <span class="mode-chip">
+      <span class="chip-dot" id="apiKeyDot" style="background:var(--red)"></span>
+      <span id="apiKeyStatus">API Key: Not set</span>
+    </span>
+    <span class="mode-chip">
+      <span class="chip-dot" id="modeDot" style="background:var(--text-dim)"></span>
+      <span id="modeStatus">Mode: —</span>
+    </span>
+  </div>
+
+  <div class="conversation-indicator" id="convIndicator">
+    <span class="conv-dot idle" id="convDot"></span>
+    <span id="convText">Idle</span>
+    <span class="mic-badge" id="micBadge">Mic Muted</span>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Device Status</div>
+    <div class="device-grid">
+      <div class="stat">
+        <div class="stat-label">Device</div>
+        <div class="stat-value" id="deviceId">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Session</div>
+        <div class="stat-value" id="sessionState">IDLE</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Battery</div>
+        <div class="stat-value" id="battery">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">CPU Temp</div>
+        <div class="stat-value" id="cpuTemp">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Recording</div>
+        <div class="stat-value" id="recording">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Uptime</div>
+        <div class="stat-value" id="uptime">—</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Controls</div>
+    <div class="controls">
+      <button class="btn btn-start" id="btnStart" onclick="sendAction('start_session')">Start Session</button>
+      <button class="btn btn-stop" id="btnStop" onclick="sendAction('stop_session')">Stop Session</button>
+      <button class="btn btn-shutdown" id="btnShutdown" onclick="sendAction('shutdown')">Shutdown</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Conversation</div>
+    <div class="transcript-area" id="transcriptArea">
+      <div class="transcript-empty">No conversation yet</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Message Log</div>
+    <div class="log-area" id="logArea"></div>
+  </div>
+
+  <div class="ws-status" id="wsStatus">Connecting to dashboard...</div>
+</div>
+
+<script>
+  let ws = null;
+  let streamingAssistantEl = null;
+  let streamingAssistantText = '';
+
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+    ws.onopen = () => {
+      document.getElementById('wsStatus').textContent = 'Dashboard connected';
+    };
+
+    ws.onclose = () => {
+      document.getElementById('wsStatus').textContent = 'Dashboard disconnected — reconnecting...';
+      setTimeout(connect, 2000);
+    };
+
+    ws.onerror = () => {
+      ws.close();
+    };
+
+    ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        handleEvent(msg);
+      } catch {}
+    };
+  }
+
+  function handleEvent(msg) {
+    const { event, data } = msg;
+
+    if (event === 'full_state') {
+      updateConnectionStatus(data.device_connected);
+      updateSessionState(data.session_state || 'IDLE');
+      if (data.device_info) updateDeviceInfo(data.device_info);
+      if (data.device_status) updateDeviceStatus(data.device_status);
+      updateApiKeyStatus(data.api_key_configured);
+      updateMode(data.audio_mode || 'loopback');
+      updateConversationState(data.conversation_state || 'idle');
+      updateMicMuted(data.mic_muted || false);
+      if (data.transcripts && data.transcripts.length > 0) {
+        const area = document.getElementById('transcriptArea');
+        area.innerHTML = '';
+        streamingAssistantEl = null;
+        streamingAssistantText = '';
+        data.transcripts.forEach(t => {
+          if (t.final) {
+            appendTranscript(t.role, t.text);
+          }
+        });
+      }
+      const logArea = document.getElementById('logArea');
+      logArea.innerHTML = '';
+      (data.recent_messages || []).forEach(entry => appendLog(entry));
+      return;
+    }
+
+    if (event === 'session_started') {
+      updateConnectionStatus(true);
+      updateSessionState('ACTIVE');
+      if (data.device_info) updateDeviceInfo(data.device_info);
+    } else if (event === 'conversation_started') {
+      updateSessionState('STREAMING');
+      if (data.mode) updateMode(data.mode);
+      if (data.resumed) {
+        updateConversationState('listening');
+      } else {
+        updateConversationState(data.mode === 'loopback' ? 'calibrating' : 'connecting_openai');
+      }
+    } else if (event === 'calibration_status') {
+      updateConversationState('calibrating_' + (data.phase || 'quiet'));
+    } else if (event === 'conversation_state') {
+      updateConversationState(data.state || 'idle');
+    } else if (event === 'calibration_complete') {
+      // State transitions are driven by conversation_state events.
+    } else if (event === 'conversation_stopped') {
+      updateSessionState('ACTIVE');
+      updateConversationState('idle');
+      updateMicMuted(false);
+    } else if (event === 'session_shutdown' || event === 'device_disconnected') {
+      updateConnectionStatus(false);
+      updateSessionState(event === 'session_shutdown' ? 'SHUTDOWN' : 'IDLE');
+      updateConversationState('idle');
+    } else if (event === 'device_status') {
+      updateDeviceStatus(data);
+    } else if (event === 'mic_muted') {
+      updateMicMuted(data.muted);
+      if (data.muted) {
+        updateConversationState('ai_speaking');
+      } else {
+        updateConversationState('listening');
+      }
+    } else if (event === 'transcript') {
+      updateTranscript(data.role, data.text, data.final);
+      return;
+    } else if (event === 'command_result') {
+      appendLog(msg, data.status === 'error');
+      return;
+    }
+
+    if (event !== 'audio_frame') {
+      appendLog(msg);
+    }
+  }
+
+  function updateSessionState(state) {
+    document.getElementById('sessionState').textContent = state;
+    updateButtonStates(state);
+  }
+
+  function updateButtonStates(state) {
+    document.getElementById('btnStart').disabled = state !== 'ACTIVE';
+    document.getElementById('btnStop').disabled = state !== 'STREAMING';
+    document.getElementById('btnShutdown').disabled = !['ACTIVE', 'STREAMING'].includes(state);
+  }
+
+  function updateConnectionStatus(connected) {
+    const dot = document.getElementById('statusDot');
+    const text = document.getElementById('statusText');
+    if (connected) {
+      dot.classList.add('connected');
+      text.textContent = 'Connected';
+    } else {
+      dot.classList.remove('connected');
+      text.textContent = 'Disconnected';
+    }
+  }
+
+  function updateDeviceInfo(info) {
+    document.getElementById('deviceId').textContent = info.device_id || '—';
+  }
+
+  function updateDeviceStatus(status) {
+    const bp = status.battery_percent;
+    document.getElementById('battery').textContent = bp != null ? bp + '%' : '—';
+    const ct = status.cpu_temp;
+    document.getElementById('cpuTemp').textContent = ct != null ? ct + '°C' : '—';
+    document.getElementById('recording').textContent = status.is_recording ? 'Yes' : 'No';
+    const ut = status.uptime_seconds;
+    if (ut != null) {
+      const m = Math.floor(ut / 60);
+      const s = Math.floor(ut % 60);
+      document.getElementById('uptime').textContent = m + 'm ' + s + 's';
+    }
+  }
+
+  function updateApiKeyStatus(configured) {
+    const dot = document.getElementById('apiKeyDot');
+    const text = document.getElementById('apiKeyStatus');
+    if (configured) {
+      dot.style.background = 'var(--green)';
+      text.textContent = 'API Key: Configured';
+    } else {
+      dot.style.background = 'var(--red)';
+      text.textContent = 'API Key: Not set (loopback mode)';
+    }
+  }
+
+  function updateMode(mode) {
+    const dot = document.getElementById('modeDot');
+    const text = document.getElementById('modeStatus');
+    if (mode === 'openai') {
+      dot.style.background = 'var(--blue)';
+      text.textContent = 'Mode: OpenAI';
+    } else {
+      dot.style.background = 'var(--yellow)';
+      text.textContent = 'Mode: Loopback';
+    }
+  }
+
+  function updateConversationState(state) {
+    const dot = document.getElementById('convDot');
+    const text = document.getElementById('convText');
+    dot.className = 'conv-dot ' + state;
+    const labels = {
+      idle: 'Idle',
+      connecting_openai: 'Connecting to OpenAI…',
+      connecting_openai_failed: 'OpenAI connection failed',
+      calibrating: 'Calibrating…',
+      calibrating_quiet: 'Stay quiet…',
+      calibrating_prompt: 'Listen…',
+      calibrating_speak: 'Say hello to start',
+      calibrating_retry: 'Say hello to start (retry)',
+      greeting: 'Assistant greeting…',
+      waiting_for_kid: 'Waiting for you…',
+      listening: 'Listening',
+      user_speaking: 'You are speaking',
+      processing: 'Processing…',
+      ai_speaking: 'AI Speaking',
+      loopback: 'Loopback Active',
+    };
+    text.textContent = labels[state] || state;
+  }
+
+  function updateMicMuted(muted) {
+    const badge = document.getElementById('micBadge');
+    if (muted) {
+      badge.classList.add('muted');
+    } else {
+      badge.classList.remove('muted');
+    }
+  }
+
+  function updateTranscript(role, text, final) {
+    if (role === 'assistant' && !final) {
+      const area = document.getElementById('transcriptArea');
+      const empty = area.querySelector('.transcript-empty');
+      if (empty) empty.remove();
+
+      if (!streamingAssistantEl) {
+        const div = document.createElement('div');
+        div.className = 'transcript-entry assistant streaming';
+        div.innerHTML = '<span class="transcript-role assistant">Assistant</span><span class="stream-text"></span>';
+        area.appendChild(div);
+        streamingAssistantEl = div.querySelector('.stream-text');
+        streamingAssistantText = '';
+      }
+      streamingAssistantText += text;
+      streamingAssistantEl.textContent = streamingAssistantText;
+      area.scrollTop = area.scrollHeight;
+      return;
+    }
+
+    if (role === 'assistant' && final) {
+      if (streamingAssistantEl) {
+        streamingAssistantEl.parentElement.classList.remove('streaming');
+        streamingAssistantEl.textContent = text;
+        streamingAssistantEl = null;
+        streamingAssistantText = '';
+      } else {
+        appendTranscript(role, text);
+      }
+      return;
+    }
+
+    if (final) {
+      appendTranscript(role, text);
+    }
+  }
+
+  function appendTranscript(role, text) {
+    const area = document.getElementById('transcriptArea');
+    const empty = area.querySelector('.transcript-empty');
+    if (empty) empty.remove();
+
+    const div = document.createElement('div');
+    div.className = 'transcript-entry ' + role;
+    const label = role === 'user' ? 'You' : 'Assistant';
+    div.innerHTML = `<span class="transcript-role ${role}">${label}</span>${escapeHtml(text)}`;
+    area.appendChild(div);
+    area.scrollTop = area.scrollHeight;
+  }
+
+  function escapeHtml(str) {
+    const el = document.createElement('span');
+    el.textContent = str;
+    return el.innerHTML;
+  }
+
+  function appendLog(entry, isError) {
+    const logArea = document.getElementById('logArea');
+    const div = document.createElement('div');
+    div.className = 'log-entry';
+
+    const ts = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : '';
+    const statusClass = isError ? ' log-error' : (entry.event === 'command_result' ? ' log-ok' : '');
+    div.innerHTML = `<span class="log-time">${ts}</span><span class="log-event${statusClass}">${entry.event}</span>${summarize(entry.data)}`;
+
+    logArea.appendChild(div);
+    logArea.scrollTop = logArea.scrollHeight;
+  }
+
+  function summarize(data) {
+    if (!data) return '';
+    const keys = Object.keys(data);
+    if (keys.length === 0) return '';
+    const skip = ['audio'];
+    const filtered = keys.filter(k => !skip.includes(k));
+    const parts = filtered.slice(0, 3).map(k => {
+      let v = data[k];
+      if (typeof v === 'object') v = JSON.stringify(v).slice(0, 40);
+      if (typeof v === 'string' && v.length > 30) v = v.slice(0, 30) + '...';
+      return `${k}=${v}`;
+    });
+    return parts.join(' ');
+  }
+
+  function sendAction(action) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ action }));
+    }
+  }
+
+  connect();
+</script>
+</body>
+</html>
