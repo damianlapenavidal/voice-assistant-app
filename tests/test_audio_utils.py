@@ -15,7 +15,6 @@ from voice_assistant.audio.utils import (
     likely_calibration_prompt_transcript,
     likely_echo_transcript,
     pcm16_to_base64,
-    trim_calibration_hello_audio,
 )
 
 
@@ -147,38 +146,9 @@ class TestMeaningfulUserText:
         assert is_meaningful_user_text(" ok ")
 
 
-class TestCalibrationHelloTrim:
-    def _loud_chunk(self, amplitude: int = 8000) -> bytes:
-        from struct import pack
-
-        sample = pack("<h", amplitude)
-        return sample * (PLAY_AUDIO_CHUNK_BYTES // SAMPLE_WIDTH)
-
-    def test_trim_drops_leading_quiet_prompt(self) -> None:
-        quiet = b"\x00\x00" * (PLAY_AUDIO_CHUNK_BYTES * 5)
-        speech = self._loud_chunk()
-        pcm = quiet + speech + speech
-
-        trimmed = trim_calibration_hello_audio(
-            pcm,
-            speech_threshold=400.0,
-            noise_floor=200.0,
-        )
-
-        assert len(trimmed) < len(pcm)
-        assert trimmed.endswith(speech + speech)
-
+class TestCalibrationPromptTranscript:
     def test_likely_calibration_prompt_transcript(self) -> None:
         assert likely_calibration_prompt_transcript("Say hello to start.")
         assert likely_calibration_prompt_transcript("say hello")
         assert not likely_calibration_prompt_transcript("Hello there")
         assert not likely_calibration_prompt_transcript("Hello.")
-
-    def test_valid_calibration_hello_transcript(self) -> None:
-        from voice_assistant.audio.utils import is_valid_calibration_hello_transcript
-
-        assert is_valid_calibration_hello_transcript("Hello.")
-        assert is_valid_calibration_hello_transcript("hi")
-        assert not is_valid_calibration_hello_transcript("Say hello to start.")
-        assert not is_valid_calibration_hello_transcript("What can we do?")
-        assert not is_valid_calibration_hello_transcript("good morning")

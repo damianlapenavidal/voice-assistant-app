@@ -125,7 +125,6 @@ class DashboardManager:
                 "device_connected": transport.is_connected,
                 "device_info": self._device_info,
                 "device_status": self._device_status,
-                "recent_messages": list(self._message_log),
                 "api_key_configured": sm.is_openai_configured,
                 "audio_mode": sm.active_mode,
                 "conversation_state": sm.conversation_state,

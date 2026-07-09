@@ -114,7 +114,7 @@ class TestLoopbackRelay:
         assert bridge.frame_count == 1
 
 
-    async def test_openai_mode_starts_early_connect_and_unmutes_after_session(self) -> None:
+    async def test_openai_mode_starts_early_connect_and_greets_first(self) -> None:
         from unittest.mock import patch
 
         import voice_assistant.openai_client.realtime as rt_mod
@@ -139,6 +139,7 @@ class TestLoopbackRelay:
             assert bridge.conversation_state == "calibrating"
             await asyncio.sleep(0)
             mock_instance.connect.assert_called_once_with(send_session_update=False)
+            # Audio captured during calibration is not forwarded to OpenAI.
             await bridge.handle_audio_frame(_frame_payload())
             transport.send_message.assert_not_called()
 
@@ -146,16 +147,12 @@ class TestLoopbackRelay:
                 "noise_floor": 350.0,
                 "user_speech_peak": 850.0,
             })
-            assert bridge.conversation_state == "calibrating_retry"
+            # Calibration confirmed a real voice -> the assistant greets first.
+            assert bridge.conversation_state == "greeting"
             mock_instance.update_vad_settings.assert_called_once()
-            mock_instance.request_opening_greeting.assert_not_called()
-            transport.send_message.assert_not_called()
+            mock_instance.request_opening_greeting.assert_called_once()
 
-    async def test_calibration_hello_skips_opening_greeting(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setattr("voice_assistant.audio.bridge.STARTUP_RESPONSE_TIMEOUT_SEC", 0.01)
+    async def test_calibration_greets_first_without_injecting_a_turn(self) -> None:
         from unittest.mock import patch
 
         import voice_assistant.openai_client.realtime as rt_mod
@@ -171,9 +168,7 @@ class TestLoopbackRelay:
         mock_instance.iter_events = fake_iter
         mock_instance.connect = AsyncMock()
         mock_instance.update_vad_settings = AsyncMock()
-        mock_instance.commit_input_buffer = AsyncMock()
 
-        hello_pcm = b"\x00\x01" * 2400
         bridge = AudioBridge(transport, loopback=False, config=None)
         bridge.set_device_ready(True)
         with patch.object(rt_mod, "RealtimeClient", return_value=mock_instance):
@@ -183,63 +178,90 @@ class TestLoopbackRelay:
             await bridge.handle_calibration_complete({
                 "noise_floor": 350.0,
                 "user_speech_peak": 850.0,
-                "hello_audio": pcm16_to_base64(hello_pcm),
             })
 
-            assert bridge.conversation_state == "processing"
-            mock_instance.request_opening_greeting.assert_not_called()
-            mock_instance.clear_input_buffer.assert_called_once()
-            mock_instance.commit_input_buffer.assert_called_once()
-            assert mock_instance.send_audio.call_count >= 1
-            assert bridge._calibration_hello_injected
-            assert bridge._awaiting_first_calibration_playback
-            assert bridge._ignore_audio_bytes_remaining == 0
+            # Assistant greets; no fabricated user turn is committed, and the
+            # conversation stays un-armed until the child actually speaks.
+            assert bridge.conversation_state == "greeting"
+            mock_instance.request_opening_greeting.assert_called_once()
+            mock_instance.commit_input_buffer.assert_not_called()
+            assert not bridge._conversation_armed
 
+            # Mic is muted for the greeting so it cannot self-echo.
+            mute_calls = [
+                c for c in transport.send_message.call_args_list
+                if c[0][0].type == MessageType.MUTE_MIC
+            ]
+            assert len(mute_calls) >= 1
             unmute_calls = [
                 c for c in transport.send_message.call_args_list
                 if c[0][0].type == MessageType.UNMUTE_MIC
             ]
             assert len(unmute_calls) == 0
 
-        bridge._cancel_startup_response_timeout()
+    async def test_calibration_greets_even_without_hello_audio(self) -> None:
+        from unittest.mock import patch
 
-    async def test_calibration_hello_ignores_phantom_speech_vad(self) -> None:
-        bridge = AudioBridge(_make_mock_transport(), loopback=False)
-        bridge._calibration_hello_injected = True
-        bridge._awaiting_first_calibration_playback = True
-        bridge._awaiting_user_transcript = True
-        bridge._set_conversation_state("processing")
+        import voice_assistant.openai_client.realtime as rt_mod
 
-        await TestOpeningListenGuard()._run_event_queue(
-            bridge,
-            [
-                RealtimeSpeechStarted(),
-                RealtimeSpeechStopped(),
-            ],
-        )
-
-        assert bridge.conversation_state != "user_speaking"
-
-    async def test_live_audio_blocked_until_first_calibration_reply(self) -> None:
         transport = _make_mock_transport()
-        bridge = AudioBridge(transport, loopback=False)
-        bridge.start()
-        bridge.set_device_ready(True)
-        bridge._awaiting_first_calibration_playback = True
+        mock_instance = AsyncMock()
+        mock_instance.is_connected = True
 
-        mock_client = AsyncMock()
-        mock_client.is_connected = True
-        bridge._realtime_client = mock_client
+        async def fake_iter():
+            return
+            yield
 
-        await bridge.handle_audio_frame(_frame_payload())
-        mock_client.send_audio.assert_not_called()
-        assert bridge.frame_count == 0
+        mock_instance.iter_events = fake_iter
+        mock_instance.connect = AsyncMock()
+        mock_instance.update_vad_settings = AsyncMock()
+
+        bridge = AudioBridge(transport, loopback=False, config=None)
+        with patch.object(rt_mod, "RealtimeClient", return_value=mock_instance):
+            await bridge.start_async()
+            await asyncio.sleep(0)
+            await bridge.handle_calibration_complete({
+                "noise_floor": 350.0,
+                "user_speech_peak": 850.0,
+            })
+
+        assert bridge.conversation_state == "greeting"
+        mock_instance.request_opening_greeting.assert_called_once()
+
+    async def test_calibration_rejected_when_no_speech_detected(self) -> None:
+        from unittest.mock import patch
+
+        import voice_assistant.openai_client.realtime as rt_mod
+
+        transport = _make_mock_transport()
+        mock_instance = AsyncMock()
+        mock_instance.is_connected = True
+
+        async def fake_iter():
+            return
+            yield
+
+        mock_instance.iter_events = fake_iter
+        mock_instance.connect = AsyncMock()
+
+        bridge = AudioBridge(transport, loopback=False, config=None)
+        with patch.object(rt_mod, "RealtimeClient", return_value=mock_instance):
+            await bridge.start_async()
+            await asyncio.sleep(0)
+            calibrated = await bridge.handle_calibration_complete({
+                "noise_floor": 350.0,
+                "user_speech_peak": 850.0,
+                "speech_detected": False,
+            })
+
+        assert calibrated is False
+        assert bridge.conversation_state == "calibrating_retry"
+        mock_instance.request_opening_greeting.assert_not_called()
 
     async def test_calibration_prompt_transcript_ignored(self) -> None:
         bridge = AudioBridge(_make_mock_transport(), loopback=False)
         transcripts: list[tuple[str, str, bool]] = []
         bridge.set_transcript_callback(lambda r, t, f: transcripts.append((r, t, f)))
-        bridge._calibration_hello_injected = True
 
         await TestOpeningListenGuard()._run_event_queue(
             bridge,
@@ -247,77 +269,6 @@ class TestLoopbackRelay:
         )
 
         assert transcripts == []
-
-    async def test_calibration_accepts_only_hello_user_transcript(self) -> None:
-        bridge = AudioBridge(_make_mock_transport(), loopback=False)
-        transcripts: list[tuple[str, str, bool]] = []
-        bridge.set_transcript_callback(lambda r, t, f: transcripts.append((r, t, f)))
-        bridge._calibration_hello_injected = True
-        bridge._awaiting_user_transcript = True
-
-        await TestOpeningListenGuard()._run_event_queue(
-            bridge,
-            [
-                RealtimeTranscript(role="user", text="Hello.", final=True),
-                RealtimeTranscript(role="assistant", text="Hi there!", final=True),
-                RealtimeTranscript(role="user", text="Hello.", final=True),
-            ],
-        )
-
-        assert transcripts == [
-            ("user", "Hello.", True),
-            ("assistant", "Hi there!", True),
-        ]
-
-    async def test_missing_hello_audio_sets_retry_not_greeting(self) -> None:
-        from unittest.mock import patch
-
-        import voice_assistant.openai_client.realtime as rt_mod
-
-        transport = _make_mock_transport()
-        mock_instance = AsyncMock()
-        mock_instance.is_connected = True
-
-        async def fake_iter():
-            return
-            yield
-
-        mock_instance.iter_events = fake_iter
-        mock_instance.connect = AsyncMock()
-        mock_instance.update_vad_settings = AsyncMock()
-
-        bridge = AudioBridge(transport, loopback=False, config=None)
-        with patch.object(rt_mod, "RealtimeClient", return_value=mock_instance):
-            await bridge.start_async()
-            await asyncio.sleep(0)
-            await bridge.handle_calibration_complete({
-                "noise_floor": 350.0,
-                "user_speech_peak": 850.0,
-            })
-
-        assert bridge.conversation_state == "calibrating_retry"
-        mock_instance.request_opening_greeting.assert_not_called()
-
-    async def test_duplicate_calibration_frames_ignored(self) -> None:
-        transport = _make_mock_transport()
-        bridge = AudioBridge(transport, loopback=False)
-        bridge.start()
-        bridge.set_device_ready(True)
-        bridge._calibration_hello_injected = True
-        bridge._ignore_audio_bytes_remaining = 4800
-
-        mock_client = AsyncMock()
-        mock_client.is_connected = True
-        bridge._realtime_client = mock_client
-
-        frame_pcm = b"\x02\x03" * 2400
-        await bridge.handle_audio_frame(_frame_payload(audio=pcm16_to_base64(frame_pcm)))
-
-        mock_client.send_audio.assert_not_called()
-        assert bridge._ignore_audio_bytes_remaining == 0
-
-        await bridge.handle_audio_frame(_frame_payload(audio=pcm16_to_base64(frame_pcm)))
-        mock_client.send_audio.assert_called_once_with(frame_pcm)
 
 
 class TestAudioBridgeResume:
@@ -726,56 +677,37 @@ class TestCalibrationHelloStartup:
 
         mock_client.cancel_response.assert_not_called()
 
-    async def test_injected_hello_arms_before_response_created(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setattr("voice_assistant.audio.bridge.STARTUP_RESPONSE_TIMEOUT_SEC", 0.01)
-
-        from unittest.mock import patch
-
-        import voice_assistant.openai_client.realtime as rt_mod
-
-        transport = _make_mock_transport()
-        mock_instance = AsyncMock()
-        mock_instance.is_connected = True
-
-        async def fake_iter():
-            return
-            yield
-
-        mock_instance.iter_events = fake_iter
-        mock_instance.connect = AsyncMock()
-        mock_instance.update_vad_settings = AsyncMock()
-        mock_instance.commit_input_buffer = AsyncMock()
-
-        hello_pcm = b"\x00\x01" * 4800
-        bridge = AudioBridge(transport, loopback=False, config=None)
-        bridge.set_device_ready(True)
-        with patch.object(rt_mod, "RealtimeClient", return_value=mock_instance):
-            await bridge.start_async()
-            await asyncio.sleep(0)
-            await bridge.handle_calibration_complete({
-                "noise_floor": 350.0,
-                "user_speech_peak": 850.0,
-                "hello_audio": pcm16_to_base64(hello_pcm),
-            })
-
-        assert bridge._conversation_armed
-        bridge._cancel_startup_response_timeout()
-        if bridge._event_task is not None:
-            bridge._event_task.cancel()
-            try:
-                await bridge._event_task
-            except asyncio.CancelledError:
-                pass
+    async def test_genuine_speech_arms_before_response_created(self) -> None:
+        # A real user turn (speech_started not ignored) must arm the
+        # conversation so the phantom-response guard doesn't cancel the reply
+        # to the child's first utterance.
+        bridge = AudioBridge(_make_mock_transport(), loopback=False)
+        bridge._conversation_armed = False
+        bridge._explicit_greeting_pending = False
 
         mock_client = await TestOpeningListenGuard()._run_event_queue(
             bridge,
-            [RealtimeResponseCreated()],
+            [RealtimeSpeechStarted(), RealtimeResponseCreated()],
         )
 
+        assert bridge._conversation_armed
         mock_client.cancel_response.assert_not_called()
+
+    async def test_echo_during_ai_speech_does_not_arm(self) -> None:
+        # While the AI is speaking, server-VAD speech_started is echo, not a
+        # real turn: it must be ignored and must not arm the conversation.
+        bridge = AudioBridge(_make_mock_transport(), loopback=False)
+        bridge._conversation_armed = False
+        bridge._explicit_greeting_pending = False
+        bridge._ai_speaking = True
+
+        mock_client = await TestOpeningListenGuard()._run_event_queue(
+            bridge,
+            [RealtimeSpeechStarted()],
+        )
+
+        assert not bridge._conversation_armed
+        _ = mock_client
 
 
 class TestOpeningListenGuard:
@@ -943,6 +875,93 @@ class TestOpeningListenGuard:
 
         assert bridge.conversation_state == "waiting_for_kid"
         assert bridge._opening_nudge_task is not None
+
+
+class TestGreetFirstStartupFlow:
+    """End-to-end greet-first flow: greeting drains, then no self-conversation."""
+
+    async def test_greeting_then_quiet_does_not_self_converse(self) -> None:
+        transport = _make_mock_transport()
+        bridge = AudioBridge(transport, loopback=False)
+        bridge.start()
+        bridge.set_device_ready(True)
+
+        mock_client = AsyncMock()
+        mock_client.is_connected = True
+        event_queue: asyncio.Queue = asyncio.Queue()
+
+        async def fake_iter():
+            while True:
+                event = await event_queue.get()
+                if event is None:
+                    return
+                yield event
+
+        mock_client.iter_events = fake_iter
+        bridge._realtime_client = mock_client
+        bridge._session_ready = True
+        bridge._event_task = asyncio.create_task(bridge._process_realtime_events())
+
+        # Assistant greets first (mic muted).
+        await bridge._begin_openai_conversation()
+        assert bridge.conversation_state == "greeting"
+
+        # OpenAI streams the greeting audio, then finishes.
+        await event_queue.put(RealtimeAudioDelta(pcm_bytes=b"\x01\x02" * 200))
+        await event_queue.put(RealtimeResponseDone(response_id="greet"))
+        await asyncio.sleep(0.05)
+
+        # The greeting arms the waiting_for_kid transition on playback complete.
+        assert bridge._pending_greeting_playback is True
+        assert not bridge._conversation_armed
+
+        seq = bridge._pending_playback_seq
+        await bridge.handle_playback_complete({"sequence_number": seq, "duration_ms": 500})
+        assert bridge.conversation_state == "waiting_for_kid"
+
+        # Child stays quiet; echo/noise makes OpenAI auto-create a response.
+        # Because nothing is armed, it must be cancelled -- no self-conversation.
+        await event_queue.put(RealtimeResponseCreated())
+        await asyncio.sleep(0.05)
+        mock_client.cancel_response.assert_called_once()
+
+        await event_queue.put(None)
+        await bridge._event_task
+
+    async def test_child_first_turn_after_greeting_is_answered(self) -> None:
+        transport = _make_mock_transport()
+        bridge = AudioBridge(transport, loopback=False)
+        bridge.start()
+        bridge.set_device_ready(True)
+        bridge._opening_phase_active = True
+
+        mock_client = AsyncMock()
+        mock_client.is_connected = True
+        event_queue: asyncio.Queue = asyncio.Queue()
+
+        async def fake_iter():
+            while True:
+                event = await event_queue.get()
+                if event is None:
+                    return
+                yield event
+
+        mock_client.iter_events = fake_iter
+        bridge._realtime_client = mock_client
+        bridge._event_task = asyncio.create_task(bridge._process_realtime_events())
+
+        # Child genuinely speaks: speech_started arms before response.created,
+        # so the phantom guard does NOT cancel the answer.
+        await event_queue.put(RealtimeSpeechStarted())
+        await event_queue.put(RealtimeSpeechStopped())
+        await event_queue.put(RealtimeResponseCreated())
+        await asyncio.sleep(0.05)
+
+        assert bridge._conversation_armed
+        mock_client.cancel_response.assert_not_called()
+
+        await event_queue.put(None)
+        await bridge._event_task
 
 
 class TestSessionManagerBridgeIntegration:

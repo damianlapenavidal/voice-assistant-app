@@ -259,12 +259,12 @@ class TestSessionManagerOpenAIIntegration:
             await sm._audio_bridge.handle_calibration_complete({
                 "noise_floor": 400.0,
                 "user_speech_peak": 800.0,
-                "hello_audio": pcm16_to_base64(b"\x00\x01" * 2400),
             })
             mock_instance.update_vad_settings.assert_called_once()
 
+            # Greet-first: the assistant opens with a greeting once calibrated.
             mock_instance.clear_input_buffer.assert_called_once()
-            mock_instance.request_opening_greeting.assert_not_called()
+            mock_instance.request_opening_greeting.assert_called_once()
 
             await sm.stop_conversation()
             mock_instance.disconnect.assert_called_once()

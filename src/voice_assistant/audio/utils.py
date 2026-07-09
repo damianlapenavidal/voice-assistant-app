@@ -25,14 +25,6 @@ CALIBRATION_PROMPT_PHRASES = (
     "say hello",
     "hello to start",
 )
-CALIBRATION_HELLO_WORDS = frozenset({
-    "hello",
-    "hi",
-    "hey",
-    "hiya",
-    "howdy",
-})
-MIN_CALIBRATION_HELLO_BYTES = PLAY_AUDIO_CHUNK_BYTES
 
 
 def pcm16_to_base64(pcm_bytes: bytes) -> str:
@@ -91,67 +83,6 @@ def likely_calibration_prompt_transcript(text: str) -> bool:
         norm == phrase or norm.startswith(phrase + " ")
         for phrase in CALIBRATION_PROMPT_PHRASES
     )
-
-
-def is_valid_calibration_hello_transcript(text: str) -> bool:
-    """Return True when a transcript is an acceptable calibration hello."""
-    if likely_calibration_prompt_transcript(text):
-        return False
-    norm = text.lower().strip().rstrip(".!?,")
-    if not norm:
-        return False
-    words = [word.rstrip(".!?,") for word in norm.split()]
-    if not words or len(words) > 2:
-        return False
-    return all(word in CALIBRATION_HELLO_WORDS for word in words)
-
-
-def pcm16_chunk_rms(pcm: bytes) -> float:
-    """Root-mean-square energy for a little-endian PCM16 mono chunk."""
-    if len(pcm) < SAMPLE_WIDTH:
-        return 0.0
-    usable = pcm[: len(pcm) // SAMPLE_WIDTH * SAMPLE_WIDTH]
-    samples = struct.unpack(f"<{len(usable) // SAMPLE_WIDTH}h", usable)
-    if not samples:
-        return 0.0
-    mean_sq = sum(sample * sample for sample in samples) / len(samples)
-    return mean_sq**0.5
-
-
-def trim_calibration_hello_audio(
-    pcm: bytes,
-    *,
-    speech_threshold: float,
-    noise_floor: float,
-    frame_ms: int = 20,
-    prefix_ms: int = 300,
-    hang_frames: int = 3,
-) -> bytes:
-    """Drop leading calibration prompt audio before the user's hello."""
-    if not pcm:
-        return pcm
-
-    threshold = max(speech_threshold, noise_floor + 80.0)
-    frame_bytes = max(SAMPLE_WIDTH, SAMPLE_RATE * frame_ms // 1000 * SAMPLE_WIDTH)
-    prefix_bytes = SAMPLE_RATE * prefix_ms // 1000 * SAMPLE_WIDTH
-
-    speech_run = 0
-    speech_start = 0
-    for offset in range(0, len(pcm), frame_bytes):
-        chunk = pcm[offset : offset + frame_bytes]
-        if pcm16_chunk_rms(chunk) >= threshold:
-            speech_run += 1
-            if speech_run >= hang_frames:
-                speech_start = max(0, offset - (hang_frames - 1) * frame_bytes)
-                break
-        else:
-            speech_run = 0
-
-    if speech_start == 0 and speech_run < hang_frames:
-        return pcm
-
-    trimmed = pcm[max(0, speech_start - prefix_bytes) :]
-    return trimmed if len(trimmed) >= MIN_CALIBRATION_HELLO_BYTES else pcm
 
 
 def generate_test_tone(

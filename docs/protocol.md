@@ -132,6 +132,58 @@ A chunk of captured microphone audio. Sent continuously while the device is reco
 
 ---
 
+#### `CALIBRATION_STATUS`
+
+Sent by the device during the calibration phase to report which step it is on. Used only to drive UI feedback; the app takes no control action on it.
+
+**Payload:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `phase` | string | Current calibration phase, e.g. `"quiet"`, `"prompt"`, `"speak"` |
+
+**Example:**
+
+```json
+{
+  "type": "CALIBRATION_STATUS",
+  "payload": { "phase": "speak" },
+  "timestamp": "2026-06-30T15:00:03.000Z"
+}
+```
+
+---
+
+#### `CALIBRATION_COMPLETE`
+
+Sent by the device **only after it has captured a genuine user "hello"** in response to the "say hello to start" prompt. This message is the gate that ends calibration and lets the app start the assistant, so its correctness is critical (see [Calibration Flow](#calibration-flow)).
+
+**Payload:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `speech_detected` | boolean | **Must be `true` only when the device actually heard the user speak.** The device must not report `true` for its own "say hello to start" prompt bleeding into the mic, or for ambient room noise. If it is `false`, the app rejects calibration and the device should re-prompt. |
+| `noise_floor` | number | Ambient RMS level measured during the quiet phase. |
+| `user_speech_peak` | number | Peak RMS level measured while the user spoke. The app requires `user_speech_peak - noise_floor >= 80`, otherwise it rejects calibration as "too quiet". |
+
+The app derives OpenAI voice-activity-detection settings from `noise_floor` and `user_speech_peak`, then caches them so a later resume can skip re-calibration.
+
+**Example:**
+
+```json
+{
+  "type": "CALIBRATION_COMPLETE",
+  "payload": {
+    "speech_detected": true,
+    "noise_floor": 320.0,
+    "user_speech_peak": 910.0
+  },
+  "timestamp": "2026-06-30T15:00:05.000Z"
+}
+```
+
+---
+
 #### `PLAYBACK_COMPLETE`
 
 Sent by the device after it finishes playing a `PLAY_AUDIO` chunk marked `is_final: true`. The app uses this to unmute the microphone only after speaker output has fully drained.
@@ -225,14 +277,20 @@ Acknowledges the device's `HELLO` message and provides session configuration.
 
 Instructs the device to begin capturing microphone audio and streaming `AUDIO_FRAME` messages.
 
-**Payload:** Empty or absent.
+**Payload:**
 
-**Example:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `skip_calibration` | boolean (optional) | When `true`, the device **must skip the calibration phase entirely** — do not play "say hello to start", do not re-measure levels — and begin streaming immediately. Sent by the app when resuming a paused session, where calibration levels are already known. When absent or `false`, the device runs its normal calibration flow before streaming. |
+
+A fresh session start sends no payload (calibrate). A **resume** sends `{"skip_calibration": true}` (do not calibrate again).
+
+**Example (resume — skip calibration):**
 
 ```json
 {
   "type": "START_AUDIO_STREAM",
-  "payload": {},
+  "payload": { "skip_calibration": true },
   "timestamp": "2026-06-30T15:00:01.000Z"
 }
 ```
@@ -465,6 +523,44 @@ stateDiagram-v2
     Ready --> Disconnecting : Transport error
     Disconnecting --> Disconnected : Transport.disconnect()
 ```
+
+---
+
+## Calibration Flow
+
+When the app sends `START_AUDIO_STREAM` **without** `skip_calibration`, the device runs a one-time calibration before real conversation audio flows. Its purpose is twofold: measure ambient noise vs. the user's voice level (so the app can tune voice-activity detection), and confirm a real person is present before the assistant starts talking.
+
+```mermaid
+sequenceDiagram
+  participant App
+  participant Pi as Raspberry Pi
+
+  App->>Pi: START_AUDIO_STREAM (no skip_calibration)
+  Pi->>Pi: Measure quiet ambient level
+  Pi->>App: CALIBRATION_STATUS (phase: quiet)
+  Pi->>Pi: Play "say hello to start"
+  Pi->>App: CALIBRATION_STATUS (phase: speak)
+  Pi->>Pi: Wait for a REAL user "hello"
+  Note over Pi: Repeat the prompt if silent;<br/>do NOT count the prompt's own<br/>playback or room noise as speech
+  Pi->>App: CALIBRATION_COMPLETE (speech_detected: true, levels)
+  App->>Pi: (assistant greeting begins)
+```
+
+### Device requirements (must-implement)
+
+These two rules are the contract the app relies on. Violating them produces the two most common calibration bugs:
+
+1. **Only report a genuine hello.** `CALIBRATION_COMPLETE` must be sent with `speech_detected: true` **only** when the microphone actually captured the user speaking. The device must not let its own "say hello to start" prompt (played through the speaker and bleeding into the mic) or ambient noise count as speech. If the device cannot confirm real speech, it should keep waiting / re-prompting rather than completing.
+   *Symptom when violated: the assistant greets even though the user stayed silent.*
+
+2. **Honor `skip_calibration`.** When `START_AUDIO_STREAM` arrives with `{"skip_calibration": true}`, the device must **not** re-run calibration — no "say hello to start" prompt, no re-measuring — and must begin streaming immediately. The app sends this on **resume**, where levels are already known.
+   *Symptom when violated: resuming a paused session replays "say hello to start" and re-calibrates.*
+
+### App behaviour (already implemented)
+
+- On a fresh start the app sends `START_AUDIO_STREAM` with no payload; on resume it sends `{"skip_calibration": true}`.
+- The app rejects calibration (and waits for a retry) if `speech_detected` is `false` or if `user_speech_peak - noise_floor < 80`.
+- While waiting for the hello, the app re-prompts about every 60 seconds and abandons the session after 5 minutes of silence.
 
 ---
 

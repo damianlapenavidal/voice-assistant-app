@@ -258,27 +258,6 @@
     padding: 20px;
   }
 
-  .log-area {
-    max-height: 260px;
-    overflow-y: auto;
-    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
-    font-size: 0.78rem;
-    line-height: 1.6;
-  }
-
-  .log-entry {
-    padding: 4px 8px;
-    border-radius: 4px;
-    word-break: break-all;
-  }
-
-  .log-entry:nth-child(even) { background: var(--surface2); }
-
-  .log-time { color: var(--text-dim); margin-right: 8px; }
-  .log-event { color: var(--accent); font-weight: 500; margin-right: 6px; }
-  .log-error { color: var(--red); }
-  .log-ok { color: var(--green); }
-
   .ws-status {
     font-size: 0.75rem;
     color: var(--text-dim);
@@ -370,11 +349,6 @@
     </div>
   </div>
 
-  <div class="card">
-    <div class="card-title">Message Log</div>
-    <div class="log-area" id="logArea"></div>
-  </div>
-
   <div class="ws-status" id="wsStatus">Connecting to dashboard...</div>
 </div>
 
@@ -431,9 +405,6 @@
           }
         });
       }
-      const logArea = document.getElementById('logArea');
-      logArea.innerHTML = '';
-      (data.recent_messages || []).forEach(entry => appendLog(entry));
       return;
     }
 
@@ -481,13 +452,6 @@
     } else if (event === 'transcript') {
       updateTranscript(data.role, data.text, data.final);
       return;
-    } else if (event === 'command_result') {
-      appendLog(msg, data.status === 'error');
-      return;
-    }
-
-    if (event !== 'audio_frame') {
-      appendLog(msg);
     }
   }
 
@@ -653,34 +617,6 @@
     const el = document.createElement('span');
     el.textContent = str;
     return el.innerHTML;
-  }
-
-  function appendLog(entry, isError) {
-    const logArea = document.getElementById('logArea');
-    const div = document.createElement('div');
-    div.className = 'log-entry';
-
-    const ts = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : '';
-    const statusClass = isError ? ' log-error' : (entry.event === 'command_result' ? ' log-ok' : '');
-    div.innerHTML = `<span class="log-time">${ts}</span><span class="log-event${statusClass}">${entry.event}</span>${summarize(entry.data)}`;
-
-    logArea.appendChild(div);
-    logArea.scrollTop = logArea.scrollHeight;
-  }
-
-  function summarize(data) {
-    if (!data) return '';
-    const keys = Object.keys(data);
-    if (keys.length === 0) return '';
-    const skip = ['audio'];
-    const filtered = keys.filter(k => !skip.includes(k));
-    const parts = filtered.slice(0, 3).map(k => {
-      let v = data[k];
-      if (typeof v === 'object') v = JSON.stringify(v).slice(0, 40);
-      if (typeof v === 'string' && v.length > 30) v = v.slice(0, 30) + '...';
-      return `${k}=${v}`;
-    });
-    return parts.join(' ');
   }
 
   function sendAction(action) {

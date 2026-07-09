@@ -17,11 +17,9 @@ from voice_assistant.audio.utils import (
     base64_to_pcm16,
     compute_recovery_ms,
     is_meaningful_user_text,
-    is_valid_calibration_hello_transcript,
     likely_calibration_prompt_transcript,
     likely_echo_transcript,
     pcm16_to_base64,
-    trim_calibration_hello_audio,
 )
 from voice_assistant.core.message import MessageType, create_message
 from voice_assistant.transport.base import Transport
@@ -33,7 +31,6 @@ BYTES_PER_SAMPLE = 2
 BYTE_RATE = SAMPLE_RATE * BYTES_PER_SAMPLE
 PLAYBACK_RECOVERY_MS = 300
 UNMUTE_SAFETY_MARGIN_MS = 1000
-STARTUP_RESPONSE_TIMEOUT_SEC = 15.0
 
 TranscriptCallback = Callable[[str, str, bool], None]
 MicMuteCallback = Callable[[bool], None]
@@ -98,13 +95,6 @@ class AudioBridge:
         self._opening_nudge_task: asyncio.Task[None] | None = None
         self._realtime_connect_task: asyncio.Task[None] | None = None
         self._session_ready = False
-        self._calibration_hello_pcm: bytes | None = None
-        self._calibration_hello_injected = False
-        self._awaiting_first_calibration_playback = False
-        self._calibration_user_transcript_emitted = False
-        self._startup_response_started = False
-        self._ignore_audio_bytes_remaining = 0
-        self._startup_response_timeout_task: asyncio.Task[None] | None = None
 
     @property
     def frame_count(self) -> int:
@@ -251,56 +241,11 @@ class AudioBridge:
             except Exception:
                 pass
 
-    def _cancel_startup_response_timeout(self) -> None:
-        if self._startup_response_timeout_task is not None:
-            self._startup_response_timeout_task.cancel()
-            self._startup_response_timeout_task = None
-
-    def _schedule_startup_response_timeout(self) -> None:
-        """Recover if the first calibration-hello response never starts."""
-        self._cancel_startup_response_timeout()
-
-        async def _timeout() -> None:
-            try:
-                await asyncio.sleep(STARTUP_RESPONSE_TIMEOUT_SEC)
-                if (
-                    self._running
-                    and not self._ai_speaking
-                    and not self._startup_response_started
-                    and self._realtime_client is not None
-                    and (
-                        self._conversation_state == "processing"
-                        or self._awaiting_first_calibration_playback
-                    )
-                ):
-                    log.warning("audio_bridge.startup_response_timeout")
-                    await self._realtime_client.create_response()
-            except asyncio.CancelledError:
-                raise
-
-        self._startup_response_timeout_task = asyncio.create_task(
-            _timeout(),
-            name="audio-bridge-startup-response-timeout",
-        )
-
-    def _reset_calibration_hello_state(self) -> None:
-        self._calibration_hello_pcm = None
-        self._calibration_hello_injected = False
-        self._awaiting_first_calibration_playback = False
-        self._calibration_user_transcript_emitted = False
-        self._startup_response_started = False
-        self._ignore_audio_bytes_remaining = 0
-        self._cancel_startup_response_timeout()
-
     def _should_ignore_live_speech_vad(self) -> bool:
-        """Ignore server VAD for injected calibration/opening audio, not live mic."""
+        """Ignore server VAD while the AI speaks or greets — not for the live mic."""
         if self._ai_speaking:
             return True
         if time.monotonic() < self._recovery_until:
-            return True
-        if self._awaiting_first_calibration_playback:
-            return True
-        if self._calibration_hello_injected and self._awaiting_user_transcript:
             return True
         if self._awaiting_opening_greeting:
             return True
@@ -382,7 +327,6 @@ class AudioBridge:
         self._conversation_armed = False
         self._reset_opening_phase()
         self._reset_transcript_ordering()
-        self._reset_calibration_hello_state()
         self._cancel_calibration_watchdog()
         log.info(
             "audio_bridge.stopped",
@@ -393,12 +337,10 @@ class AudioBridge:
         """Stop the bridge and disconnect from OpenAI if connected."""
         self._cancel_unmute_timeout()
         self._cancel_opening_nudge_task()
-        self._cancel_startup_response_timeout()
         self._cancel_calibration_watchdog()
         if self._mic_muted and self._device_ready:
             await self._send_mute(False)
         self.stop()
-        self._reset_calibration_hello_state()
         await self._disconnect_realtime()
 
     async def reset_on_disconnect(self) -> None:
@@ -425,7 +367,6 @@ class AudioBridge:
         self._awaiting_opening_greeting = False
         self._running = False
         self._reset_transcript_ordering()
-        self._reset_calibration_hello_state()
         log.info("audio_bridge.reset_on_disconnect")
 
     async def handle_audio_frame(self, payload: dict) -> None:
@@ -443,34 +384,7 @@ class AudioBridge:
         if self._awaiting_opening_greeting:
             return
 
-        if self._awaiting_first_calibration_playback:
-            log.debug("audio_bridge.live_audio_blocked_until_first_reply")
-            return
-
         audio_b64 = payload.get("audio", "")
-        if (
-            not self._loopback
-            and self._calibration_hello_injected
-            and self._ignore_audio_bytes_remaining > 0
-            and audio_b64
-        ):
-            pcm_bytes = base64_to_pcm16(audio_b64)
-            if len(pcm_bytes) <= self._ignore_audio_bytes_remaining:
-                self._ignore_audio_bytes_remaining -= len(pcm_bytes)
-                log.debug(
-                    "audio_bridge.calibration_hello_duplicate_ignored",
-                    bytes=len(pcm_bytes),
-                    remaining=self._ignore_audio_bytes_remaining,
-                )
-                return
-            skip = self._ignore_audio_bytes_remaining
-            self._ignore_audio_bytes_remaining = 0
-            pcm_bytes = pcm_bytes[skip:]
-            if self._realtime_client is not None and self._realtime_client.is_connected:
-                await self._realtime_client.send_audio(pcm_bytes)
-            self._frame_count += 1
-            return
-
         t_start = time.monotonic()
         self._frame_count += 1
         if self._frame_count == 1:
@@ -539,13 +453,6 @@ class AudioBridge:
                 ):
                     self._set_conversation_state("waiting_for_kid")
                     self._schedule_opening_nudge()
-            elif self._awaiting_first_calibration_playback:
-                self._awaiting_first_calibration_playback = False
-                if self._calibration_hello_pcm:
-                    self._ignore_audio_bytes_remaining = len(self._calibration_hello_pcm)
-                self._recovery_until = time.monotonic() + 1.5
-                self._calibration_hello_injected = False
-                self._set_conversation_state("listening")
             elif self._conversation_armed:
                 self._set_conversation_state("listening")
             elif self._opening_phase_active:
@@ -586,32 +493,12 @@ class AudioBridge:
             noise_floor=noise_floor,
             user_speech_peak=user_speech_peak,
         )
-        hello_b64 = payload.get("hello_audio") or ""
-        if hello_b64:
-            raw_pcm = base64_to_pcm16(hello_b64)
-            speech_threshold = float(
-                payload.get("speech_threshold", noise_floor + 200.0),
-            )
-            self._calibration_hello_pcm = trim_calibration_hello_audio(
-                raw_pcm,
-                speech_threshold=speech_threshold,
-                noise_floor=noise_floor,
-            )
-            if len(self._calibration_hello_pcm) != len(raw_pcm):
-                log.info(
-                    "audio_bridge.calibration_hello_trimmed",
-                    raw_bytes=len(raw_pcm),
-                    trimmed_bytes=len(self._calibration_hello_pcm),
-                )
-        else:
-            self._calibration_hello_pcm = None
         log.info(
             "audio_bridge.calibration_complete",
             noise_floor=noise_floor,
             user_speech_peak=user_speech_peak,
             vad_threshold=vad_settings.threshold,
             silence_ms=vad_settings.silence_ms,
-            hello_audio_bytes=len(self._calibration_hello_pcm or b""),
         )
 
         self._calibration_phase = None
@@ -619,82 +506,25 @@ class AudioBridge:
         self._cancel_calibration_watchdog()
 
         if not self._loopback:
+            # Greet the child first, then wait for them to speak. We do NOT
+            # inject the calibration audio as a fabricated user turn -- that
+            # made the assistant "respond to a hello you never said" and, by
+            # arming the conversation immediately, let the AI's own echo
+            # trigger an endless self-conversation.
             self._set_conversation_state("connecting_openai")
             await self._ensure_realtime_connected(vad_settings=vad_settings)
-            if self._calibration_hello_pcm:
-                await self._begin_calibration_hello_conversation()
-            else:
-                log.warning("audio_bridge.calibration_missing_hello_audio")
-                self._set_conversation_state("calibrating_retry")
-                return False
+            await self._begin_openai_conversation()
         else:
             self._set_conversation_state("listening")
         return True
 
-    async def _reject_calibration_hello_turn(self, transcript: str) -> None:
-        """Invalid calibration speech — cancel the AI turn and ask for retry."""
-        log.warning(
-            "audio_bridge.calibration_hello_rejected",
-            transcript=transcript[:80],
-        )
-        self._cancel_startup_response_timeout()
-        self._awaiting_user_transcript = False
-        self._buffered_transcripts.clear()
-        if self._realtime_client is not None:
-            if self._ai_speaking:
-                await self._realtime_client.cancel_response()
-            await self._realtime_client.clear_input_buffer()
-        self._ai_speaking = False
-        self._awaiting_first_calibration_playback = False
-        self._calibration_hello_injected = False
-        self._calibration_user_transcript_emitted = False
-        self._ignore_audio_bytes_remaining = 0
-        self._set_conversation_state("calibrating_retry")
-
-    async def _begin_calibration_hello_conversation(self) -> None:
-        """Use the calibration hello as the first user turn — no canned greeting."""
-        if self._realtime_client is None or not self._session_ready:
-            return
-        if not self._calibration_hello_pcm:
-            await self._begin_openai_conversation()
-            return
-
-        await self._realtime_client.clear_input_buffer()
-        self._reset_opening_phase()
-        self._arm_conversation()
-        self._awaiting_user_transcript = True
-        self._set_conversation_state("processing")
-        if self._device_ready and not self._mic_muted:
-            await self._send_mute(True)
-        log.info(
-            "audio_bridge.calibration_hello_received",
-            bytes=len(self._calibration_hello_pcm),
-            skipping_opening_greeting=True,
-        )
-        await self._inject_calibration_hello()
-        self._calibration_hello_injected = True
-        self._awaiting_first_calibration_playback = True
-        self._schedule_startup_response_timeout()
-
-    async def _inject_calibration_hello(self) -> None:
-        """Append calibration speech to OpenAI and commit it as the first turn."""
-        pcm = self._calibration_hello_pcm
-        if not pcm or self._realtime_client is None:
-            return
-
-        offset = 0
-        while offset < len(pcm):
-            chunk = pcm[offset : offset + PLAY_AUDIO_CHUNK_BYTES]
-            await self._realtime_client.send_audio(chunk)
-            offset += len(chunk)
-        await self._realtime_client.commit_input_buffer()
-        log.info(
-            "audio_bridge.calibration_hello_injected",
-            bytes=len(pcm),
-        )
-
     async def _begin_openai_conversation(self) -> None:
-        """Unmute the device mic and have the assistant greet the user first."""
+        """Have the assistant greet the user first, mic muted so it can't self-echo.
+
+        The device stays muted for the whole greeting; handle_playback_complete
+        unmutes once the greeting has finished draining through the speaker,
+        which then transitions to waiting_for_kid.
+        """
         if self._realtime_client is None or not self._session_ready:
             return
 
@@ -704,8 +534,8 @@ class AudioBridge:
         self._awaiting_opening_greeting = True
         self._explicit_greeting_pending = True
         self._set_conversation_state("greeting")
-        await self._send_mute(False)
-        log.info("audio_bridge.unmuted_after_session_ready")
+        await self._send_mute(True)
+        log.info("audio_bridge.muted_for_opening_greeting")
         await self._realtime_client.request_opening_greeting()
         log.info("audio_bridge.opening_greeting_started")
 
@@ -972,7 +802,6 @@ class AudioBridge:
         try:
             async for event in self._realtime_client.iter_events():
                 if isinstance(event, RealtimeAudioDelta):
-                    self._cancel_startup_response_timeout()
                     if not self._ai_speaking:
                         self._ai_speaking = True
                         self._set_conversation_state("ai_speaking")
@@ -986,30 +815,37 @@ class AudioBridge:
                     await self._flush_partial_chunks()
 
                 elif isinstance(event, RealtimeResponseCreated):
-                    if self._calibration_hello_injected and not self._startup_response_started:
-                        self._startup_response_started = True
                     if (
                         not self._explicit_greeting_pending
                         and not self._conversation_armed
                         and self._realtime_client is not None
                     ):
+                        # Nothing armed this turn (no greeting, user hasn't
+                        # spoken) -- a response created here is server VAD
+                        # firing on the AI's own echo or room noise. Cancel it
+                        # so the assistant never talks to itself.
                         log.info("audio_bridge.phantom_response_cancelled")
                         await self._realtime_client.cancel_response()
                         await self._realtime_client.clear_input_buffer()
 
                 elif isinstance(event, RealtimeResponseDone):
-                    self._cancel_startup_response_timeout()
                     if self._awaiting_opening_greeting:
                         self._awaiting_opening_greeting = False
                         log.info("audio_bridge.opening_greeting_complete")
-                    self._explicit_greeting_pending = False
                     await self._flush_partial_chunks()
+                    # Finalize while _explicit_greeting_pending is still set so
+                    # the greeting's playback arms the waiting_for_kid nudge.
                     await self._finalize_response_audio()
+                    self._explicit_greeting_pending = False
 
                 elif isinstance(event, RealtimeSpeechStarted):
                     if self._should_ignore_live_speech_vad():
                         log.debug("audio_bridge.speech_started_ignored")
                         continue
+                    # A genuine user turn (past greeting/AI-speech/recovery):
+                    # arm now, before response.created, so the phantom guard
+                    # above doesn't cancel the child's first real response.
+                    self._arm_conversation()
                     self._set_conversation_state("user_speaking")
                     log.info("audio_bridge.user_speaking")
 
@@ -1023,24 +859,17 @@ class AudioBridge:
                     log.info("audio_bridge.user_done_speaking")
 
                 elif isinstance(event, RealtimeTranscript):
-                    if event.role == "user" and event.final:
-                        if likely_calibration_prompt_transcript(event.text):
-                            log.info(
-                                "audio_bridge.calibration_prompt_transcript_ignored",
-                                text=event.text[:80],
-                            )
-                            continue
-                        if self._calibration_hello_injected:
-                            if not is_valid_calibration_hello_transcript(event.text):
-                                await self._reject_calibration_hello_turn(event.text)
-                                continue
-                            if self._calibration_user_transcript_emitted:
-                                log.debug(
-                                    "audio_bridge.calibration_hello_duplicate_transcript_ignored",
-                                    text=event.text[:80],
-                                )
-                                continue
-                            self._calibration_user_transcript_emitted = True
+                    if (
+                        event.role == "user"
+                        and event.final
+                        and likely_calibration_prompt_transcript(event.text)
+                    ):
+                        # Stray "say hello to start" prompt picked up by the mic.
+                        log.info(
+                            "audio_bridge.calibration_prompt_transcript_ignored",
+                            text=event.text[:80],
+                        )
+                        continue
                     if (
                         event.role == "user"
                         and event.final
@@ -1062,7 +891,6 @@ class AudioBridge:
                     self._handle_transcript(event.role, event.text, event.final)
 
                 elif isinstance(event, RealtimeErrorEvent):
-                    self._cancel_startup_response_timeout()
                     log.error(
                         "audio_bridge.realtime_error",
                         message=event.message,
