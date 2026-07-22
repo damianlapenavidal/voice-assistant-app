@@ -53,7 +53,7 @@ Sent by the device immediately after connecting. Announces the device and its ca
 | Field | Type | Description |
 |-------|------|-------------|
 | `device_id` | string | Unique identifier for the device |
-| `device_type` | string | `"pi5"` or `"piZero2W"` |
+| `device_type` | string | `"pi5"` or `"pi_zero_2w"` |
 | `firmware_version` | string | Firmware/software version on the device |
 | `capabilities` | string[] | List of supported features (e.g., `["audio_capture", "audio_playback"]`) |
 

@@ -32,6 +32,18 @@ BYTE_RATE = SAMPLE_RATE * BYTES_PER_SAMPLE
 PLAYBACK_RECOVERY_MS = 300
 UNMUTE_SAFETY_MARGIN_MS = 1000
 
+# Brief silence appended to the end of every response so device-side playback
+# clipping (e.g. aplay's ALSA buffer not fully draining before the pipe closes)
+# trims trailing silence instead of the last word of the assistant's reply.
+PLAYBACK_TAIL_SILENCE_MS = 300
+TAIL_SILENCE = b"\x00" * (int(BYTE_RATE * PLAYBACK_TAIL_SILENCE_MS / 1000) & ~1)
+
+# Assistant transcripts are held until the (async) user transcription lands so
+# the log reads in conversational order. If that user transcript never arrives
+# — empty/failed transcription, or it was filtered as echo/calibration noise —
+# release the held assistant lines after this timeout so nothing is dropped.
+USER_TRANSCRIPT_TIMEOUT_SEC = 5.0
+
 TranscriptCallback = Callable[[str, str, bool], None]
 MicMuteCallback = Callable[[bool], None]
 ConversationStateCallback = Callable[[str], None]
@@ -88,6 +100,7 @@ class AudioBridge:
         self._last_assistant_text = ""
         self._awaiting_user_transcript = False
         self._buffered_transcripts: list[tuple[str, str, bool]] = []
+        self._user_transcript_timeout_task: asyncio.Task[None] | None = None
         self._opening_phase_active = False
         self._opening_nudge_sent = False
         self._explicit_greeting_pending = False
@@ -152,17 +165,55 @@ class AudioBridge:
             self._emit_transcript(role, text, final)
         self._buffered_transcripts.clear()
 
+    def _cancel_user_transcript_timeout(self) -> None:
+        if self._user_transcript_timeout_task is not None:
+            self._user_transcript_timeout_task.cancel()
+            self._user_transcript_timeout_task = None
+
+    def _schedule_user_transcript_timeout(self) -> None:
+        """Release held assistant transcripts if the user transcript never lands."""
+        self._cancel_user_transcript_timeout()
+
+        async def _timeout() -> None:
+            try:
+                await asyncio.sleep(USER_TRANSCRIPT_TIMEOUT_SEC)
+            except asyncio.CancelledError:
+                raise
+            if self._awaiting_user_transcript:
+                log.info(
+                    "audio_bridge.user_transcript_timeout_flush",
+                    buffered=len(self._buffered_transcripts),
+                )
+                self._awaiting_user_transcript = False
+                self._flush_buffered_transcripts()
+
+        self._user_transcript_timeout_task = asyncio.create_task(
+            _timeout(),
+            name="audio-bridge-user-transcript-timeout",
+        )
+
+    def _resolve_awaited_user_turn(self) -> None:
+        """A user turn produced no usable transcript; release held lines anyway."""
+        if not self._awaiting_user_transcript:
+            return
+        self._cancel_user_transcript_timeout()
+        self._awaiting_user_transcript = False
+        self._flush_buffered_transcripts()
+
     def _handle_transcript(self, role: str, text: str, final: bool) -> None:
         """Emit transcripts in conversational order (user before assistant).
 
         OpenAI often delivers the assistant transcript before async user
         transcription completes; buffer assistant lines until the user turn lands.
+        A timeout (see _schedule_user_transcript_timeout) guarantees held lines
+        are still emitted if that user transcript never arrives.
         """
         if role == "assistant" and self._awaiting_user_transcript:
             self._buffered_transcripts.append((role, text, final))
             return
 
         if role == "user" and final:
+            self._cancel_user_transcript_timeout()
             self._awaiting_user_transcript = False
             self._emit_transcript(role, text, final)
             self._flush_buffered_transcripts()
@@ -230,8 +281,11 @@ class AudioBridge:
         log.info("audio_bridge.conversation_armed")
 
     def _reset_transcript_ordering(self) -> None:
+        # Emit any still-held assistant lines before clearing so a teardown mid
+        # turn never silently drops them.
+        self._cancel_user_transcript_timeout()
+        self._flush_buffered_transcripts()
         self._awaiting_user_transcript = False
-        self._buffered_transcripts.clear()
 
     def _set_conversation_state(self, state: str) -> None:
         self._conversation_state = state
@@ -766,7 +820,15 @@ class AudioBridge:
             await self._send_play_audio_chunk(chunk, is_final=False)
 
     async def _finalize_response_audio(self) -> None:
-        """Flush remaining audio as the final chunk and arm unmute gating."""
+        """Flush remaining audio (plus a trailing silence pad) and arm unmute gating."""
+        async with self._buffer_lock:
+            has_audio = self._chunks_sent_this_response > 0 or len(self._audio_buffer) > 0
+            if has_audio and TAIL_SILENCE:
+                self._audio_buffer.extend(TAIL_SILENCE)
+
+        # The silence pad may push the buffer past one or more full chunks.
+        await self._flush_partial_chunks()
+
         async with self._buffer_lock:
             remainder = bytes(self._audio_buffer)
             self._audio_buffer.clear()
@@ -855,6 +917,7 @@ class AudioBridge:
                         continue
                     self._flush_buffered_transcripts()
                     self._awaiting_user_transcript = True
+                    self._schedule_user_transcript_timeout()
                     self._set_conversation_state("processing")
                     log.info("audio_bridge.user_done_speaking")
 
@@ -869,6 +932,9 @@ class AudioBridge:
                             "audio_bridge.calibration_prompt_transcript_ignored",
                             text=event.text[:80],
                         )
+                        # This was the user turn we were holding lines for; release
+                        # the buffered assistant reply so it is never orphaned.
+                        self._resolve_awaited_user_turn()
                         continue
                     if (
                         event.role == "user"
@@ -879,6 +945,7 @@ class AudioBridge:
                             "audio_bridge.echo_transcript_ignored",
                             text=event.text[:80],
                         )
+                        self._resolve_awaited_user_turn()
                         continue
                     if (
                         event.role == "user"
@@ -896,14 +963,18 @@ class AudioBridge:
                         message=event.message,
                         code=event.code,
                     )
+                    # Release any assistant lines held for the in-flight turn so
+                    # an API error never strands them.
+                    self._resolve_awaited_user_turn()
                     if self._conversation_state == "processing":
-                        self._awaiting_user_transcript = False
                         self._set_conversation_state("listening")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.error("audio_bridge.realtime_event_error", error=str(exc))
         finally:
+            self._cancel_user_transcript_timeout()
+            self._flush_buffered_transcripts()
             if self._audio_buffer or self._chunks_sent_this_response:
                 await self._flush_partial_chunks()
                 await self._finalize_response_audio()

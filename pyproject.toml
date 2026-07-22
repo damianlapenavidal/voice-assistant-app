@@ -29,6 +29,9 @@ voice-assistant = "voice_assistant.main:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"voice_assistant.prompts" = ["*.md", "personas/*.md"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

@@ -62,12 +62,17 @@ class DashboardManager:
         elif event == "mic_muted":
             self._mic_muted = data.get("muted", False)
         elif event == "transcript":
-            self._transcripts.append({
-                "role": data.get("role", ""),
-                "text": data.get("text", ""),
-                "final": data.get("final", False),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
+            # Persist only completed lines in the bounded history. Streaming
+            # partials are still broadcast live to connected browsers below, but
+            # keeping them here would let a single long reply's many deltas evict
+            # earlier final lines from the deque.
+            if data.get("final"):
+                self._transcripts.append({
+                    "role": data.get("role", ""),
+                    "text": data.get("text", ""),
+                    "final": True,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
 
         entry = {
             "event": event,

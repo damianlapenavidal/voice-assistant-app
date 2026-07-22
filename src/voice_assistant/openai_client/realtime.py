@@ -15,7 +15,7 @@ import structlog
 import websockets
 from websockets.asyncio.client import ClientConnection
 
-from voice_assistant.config import Config, DEFAULT_OPENING_GREETING_INSTRUCTIONS
+from voice_assistant.config import Config
 from voice_assistant.audio.utils import SAMPLE_RATE, base64_to_pcm16, pcm16_to_base64
 from voice_assistant.audio.vad import VadSettings, derive_vad_settings
 
@@ -129,6 +129,7 @@ class RealtimeClient:
         self._instructions = (
             instructions if instructions is not None else cfg.assistant_instructions
         )
+        self._opening_greeting_instructions = cfg.opening_greeting_instructions
         self._apply_vad_settings(
             vad_settings
             or derive_vad_settings(noise_floor=400.0, user_speech_peak=650.0)
@@ -268,7 +269,9 @@ class RealtimeClient:
             raise RealtimeNotConnectedError("Realtime client is not connected")
 
         greeting_instructions = (
-            instructions if instructions is not None else DEFAULT_OPENING_GREETING_INSTRUCTIONS
+            instructions
+            if instructions is not None
+            else self._opening_greeting_instructions
         )
         event = {
             "type": "response.create",

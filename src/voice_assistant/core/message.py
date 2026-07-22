@@ -35,7 +35,7 @@ class MessageType(str, Enum):
 
 class HelloPayload(BaseModel):
     device_id: str
-    device_type: Literal["pi5", "piZero2W"]
+    device_type: Literal["pi5", "pi_zero_2w"]
     firmware_version: str
     capabilities: list[str]
 

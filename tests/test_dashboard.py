@@ -101,6 +101,34 @@ class TestDashboardEventLoop:
 
         await session.stop_receive_loop()
 
+    async def test_history_stores_only_final_transcripts(self) -> None:
+        transport = MockTransport()
+        session = SessionManager(transport)
+        await session.wait_for_device()
+        dashboard = DashboardManager(session, main_loop=asyncio.get_running_loop())
+
+        # Streaming partials must not be persisted in the bounded history...
+        dashboard._on_session_event(
+            "transcript", {"role": "assistant", "text": "Hel", "final": False}
+        )
+        dashboard._on_session_event(
+            "transcript", {"role": "assistant", "text": "Hello", "final": False}
+        )
+        assert len(dashboard._transcripts) == 0
+
+        # ...only the completed line is kept.
+        dashboard._on_session_event(
+            "transcript", {"role": "assistant", "text": "Hello there!", "final": True}
+        )
+        assert list(dashboard._transcripts) == [
+            {
+                "role": "assistant",
+                "text": "Hello there!",
+                "final": True,
+                "timestamp": dashboard._transcripts[0]["timestamp"],
+            }
+        ]
+
     async def test_stop_clears_transcripts_but_pause_does_not(self) -> None:
         transport = MockTransport()
         session = SessionManager(transport)
