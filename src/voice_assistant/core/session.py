@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import structlog
 
-from voice_assistant.config import Config
+from voice_assistant.config import Config, expected_device_type
 from voice_assistant.core.message import (
     Message,
     MessageType,
@@ -133,7 +133,30 @@ class SessionManager:
 
         await self._complete_handshake(hello)
 
+    def _verify_target(self, hello: Message) -> None:
+        """Reject a HELLO from a board other than the one the launcher selected.
+
+        Without this, launching `start-pizero2w.sh` while the Pi 5 happens to be
+        the thing that connects would run a full session against the wrong
+        hardware and only show up as confusing audio behaviour.
+        """
+        expected = expected_device_type(self._config.target)
+        if expected is None:
+            return
+
+        actual = (hello.payload or {}).get("device_type")
+        if actual == expected:
+            return
+
+        raise TransportError(
+            f"Target mismatch: launcher selected target "
+            f"'{self._config.target}' (expects device_type '{expected}') but the "
+            f"device announced device_type '{actual}'. Launch the matching "
+            f"target, or check which Pi is connected to this app."
+        )
+
     async def _complete_handshake(self, hello: Message) -> None:
+        self._verify_target(hello)
         self._session_id = str(uuid4())
         ack = create_message(
             MessageType.HELLO_ACK,
@@ -156,11 +179,14 @@ class SessionManager:
             "session.device_ready",
             session_id=self._session_id,
             device_id=device_id,
+            target=self._config.target or None,
+            device_type=(hello.payload or {}).get("device_type"),
         )
         self._emit("session_started", {
             "session_id": self._session_id,
             "device_id": device_id,
             "device_info": hello.payload,
+            "target": self._config.target,
         })
 
     async def start_conversation(self) -> None:

@@ -1,0 +1,84 @@
+# Raspberry Pi Zero 2 W audio endpoint -- USER service template.
+#
+# INSTALL ON: the Pi Zero 2 W (not the Mac).
+#     mkdir -p ~/.config/systemd/user
+#     cp deploy/systemd/voice-assistant-pizero2w.service ~/.config/systemd/user/
+#     # edit ExecStart to the endpoint's real entrypoint, then:
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now voice-assistant-pizero2w
+#     loginctl enable-linger "$(id -un)"     # survive SSH logout + start at boot
+#
+# A *user* service is used deliberately: it needs no sudo, so deploying never
+# requires a passwordless-sudo grant. The endpoint only needs the `audio` group
+# (already granted) to reach /dev/snd -- it does not need root.
+#
+# !! ExecStart below is a PLACEHOLDER. As of this template's writing the
+# !! voice-assistant-piZero2W repository had not yet been cloned onto the
+# !! device and no endpoint entrypoint existed, so no command could be
+# !! verified. Set ExecStart to the endpoint's real entrypoint before enabling.
+
+[Unit]
+Description=Voice Assistant audio endpoint (Raspberry Pi Zero 2 W)
+Documentation=https://github.com/damianlapenavidal/voice-assistant-piZero2W
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/voice-assistant-piZero2W
+
+# Audio + transport configuration. These mirror config/targets.example.env in
+# voice-assistant-app and are the VERIFIED settings for this board.
+#
+# The card is addressed by ID, never by numeric index: this Pi also has a
+# vc4hdmi card, so index numbers are not stable across boots.
+Environment=VOICE_ASSISTANT_TARGET=pizero2w
+Environment=VOICE_ASSISTANT_ALSA_CARD_ID=sndrpigooglevoi
+Environment=VOICE_ASSISTANT_CAPTURE_DEVICE=plughw:CARD=sndrpigooglevoi,DEV=0
+Environment=VOICE_ASSISTANT_PLAYBACK_DEVICE=plughw:CARD=sndrpigooglevoi,DEV=0
+Environment=VOICE_ASSISTANT_AUDIO_SAMPLE_RATE=48000
+Environment=VOICE_ASSISTANT_CAPTURE_FORMAT=S32_LE
+# The ICS-43434 is mono in the LEFT slot of a 2-channel I2S stream; the right
+# slot is silent by design. Capture 2, use the left one.
+Environment=VOICE_ASSISTANT_CAPTURE_CHANNELS=2
+Environment=VOICE_ASSISTANT_MIC_CHANNEL=left
+Environment=VOICE_ASSISTANT_PLAYBACK_CHANNELS=2
+# Steady multipliers. Do NOT normalize realtime chunks individually.
+Environment=VOICE_ASSISTANT_INPUT_GAIN=1.0
+Environment=VOICE_ASSISTANT_PLAYBACK_GAIN=0.35
+
+# Where the app (the Mac) is listening. The Pi dials out to it.
+# Override per-session with a drop-in or an EnvironmentFile:
+#   systemctl --user edit voice-assistant-pizero2w
+EnvironmentFile=-%h/.config/voice-assistant-pizero2w.env
+
+# PLACEHOLDER -- replace with the endpoint's real entrypoint.
+ExecStart=/usr/bin/false "Set ExecStart in ~/.config/systemd/user/voice-assistant-pizero2w.service"
+
+# Restart on unexpected failure, but do not hammer the Pi Zero: 5s between
+# tries, and give up after 5 failures in 5 minutes so a broken build cannot
+# spin the CPU (and drain a battery) indefinitely.
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Keep the Zero 2 W light: it is a 512 MB, 4-core board intended to run on
+# battery. Nice the process slightly below interactive work, and cap memory so
+# a leak fails loudly instead of swapping the board to death.
+Nice=-5
+MemoryMax=256M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=va-pizero2w
+
+# Modest hardening. The endpoint needs /dev/snd and the network, nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/voice-assistant-piZero2W
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,68 @@
+# Raspberry Pi 5 audio endpoint -- USER service template.
+#
+# INSTALL ON: the Pi 5 (not the Mac).
+#     mkdir -p ~/.config/systemd/user
+#     cp deploy/systemd/voice-assistant-pi5.service ~/.config/systemd/user/
+#     # edit ExecStart AND the audio settings, then:
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now voice-assistant-pi5
+#     loginctl enable-linger "$(id -un)"
+#
+# !! UNVERIFIED. The Pi 5 was not reachable when this template was written, so
+# !! neither its entrypoint nor its audio hardware could be inspected. Nothing
+# !! here is copied from the Pi Zero 2 W on purpose -- the two boards must not
+# !! be assumed to share a sound card, device string, or channel layout.
+# !!
+# !! Before enabling, ON THE PI 5:
+# !!     cat /proc/asound/cards
+# !!     arecord -l ; aplay -l ; aplay -L
+# !! then fill in the Environment= lines below and the matching PI5_* keys in
+# !! voice-assistant-app/config/targets.local.env.
+
+[Unit]
+Description=Voice Assistant audio endpoint (Raspberry Pi 5)
+Documentation=https://github.com/damianlapenavidal/voice-assistant-pi5
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/voice-assistant-pi5
+
+Environment=VOICE_ASSISTANT_TARGET=pi5
+
+# UNVERIFIED -- fill in from `aplay -L` on the Pi 5. Always address the card by
+# ID (CARD=<id>), never by numeric index: indexes move when cards are added.
+#Environment=VOICE_ASSISTANT_ALSA_CARD_ID=<verify-on-pi5>
+#Environment=VOICE_ASSISTANT_CAPTURE_DEVICE=plughw:CARD=<verify-on-pi5>,DEV=0
+#Environment=VOICE_ASSISTANT_PLAYBACK_DEVICE=plughw:CARD=<verify-on-pi5>,DEV=0
+#Environment=VOICE_ASSISTANT_AUDIO_SAMPLE_RATE=<verify-on-pi5>
+#Environment=VOICE_ASSISTANT_CAPTURE_FORMAT=<verify-on-pi5>
+#Environment=VOICE_ASSISTANT_CAPTURE_CHANNELS=<verify-on-pi5>
+#Environment=VOICE_ASSISTANT_MIC_CHANNEL=<verify-on-pi5>
+#Environment=VOICE_ASSISTANT_PLAYBACK_CHANNELS=<verify-on-pi5>
+#Environment=VOICE_ASSISTANT_INPUT_GAIN=1.0
+#Environment=VOICE_ASSISTANT_PLAYBACK_GAIN=<verify-on-pi5>
+
+EnvironmentFile=-%h/.config/voice-assistant-pi5.env
+
+# PLACEHOLDER -- replace with the endpoint's real entrypoint.
+ExecStart=/usr/bin/false "Set ExecStart in ~/.config/systemd/user/voice-assistant-pi5.service"
+
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=va-pi5
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/voice-assistant-pi5
+
+[Install]
+WantedBy=default.target
