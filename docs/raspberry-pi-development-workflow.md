@@ -213,12 +213,18 @@ Anything after `--` is passed to the app:
 10. **Verify the handshake** — a watchdog reports whether the endpoint actually
     dialled in, and fails loudly with the log command if it did not.
 
-`Ctrl+C` stops the local app cleanly. **It does not stop the remote service** —
-that is deliberate. Stop it explicitly:
+`Ctrl+C` stops the local app and its reverse tunnel cleanly. **It does not stop
+the remote service** — that is deliberate. Tear down the full session with:
 
 ```bash
-ssh voice-assistant-pizero2w 'systemctl --user stop voice-assistant-pizero2w'
+./scripts/terminate-pizero2w.sh     # Raspberry Pi Zero 2 W
+./scripts/terminate-pi5.sh          # Raspberry Pi 5
+# or: ./scripts/stop-target.sh pizero2w
 ```
+
+That stops the Pi systemd unit, any leftover Mac `voice_assistant` listener on
+the target port, and orphaned `ssh -R` tunnels. Safe to re-run when already
+stopped.
 
 ### `--dry-run` guarantees
 
@@ -290,11 +296,13 @@ systemctl --user daemon-reload
 systemctl --user enable --now voice-assistant-pizero2w
 ```
 
-> **The templates ship with `ExecStart=/usr/bin/false` on purpose.** The endpoint
-> repositories had not been cloned onto either device when this was written, so
-> no real entrypoint existed to reference. Inventing one would have produced a
-> service that looks installed and silently does nothing. Set `ExecStart` to the
-> endpoint's actual entrypoint before enabling.
+> The Pi Zero 2 W template's `ExecStart` targets `ws://127.0.0.1:8765` -- its
+> own loopback, never a Mac IP -- because this Pi's iPhone hotspot has been
+> observed running IPv6-only NAT64/464XLAT on this iPhone/Mac pairing (see
+> "Mac has no routable IPv4" under Troubleshooting). The launcher opens an SSH
+> reverse tunnel before each session that forwards this back to the app's real
+> listening socket; see `scripts/lib/tunnel.sh` and
+> `PIZERO2W_USE_SSH_TUNNEL` in `config/targets.local.env`.
 
 ### Lingering — required for a user service
 
@@ -598,6 +606,34 @@ shows the app listening. A Mac IP changes with every network switch.
 Expected on the hotspot. Use `.local` in `~/.ssh/config` rather than an IP.
 **[Mac]** `dns-sd -q voice-assistant-pizero2w.local` to check mDNS resolution.
 
+### Mac has no routable IPv4 (SSH reverse tunnel)
+On this iPhone/Mac pairing the Personal Hotspot has been observed running
+IPv6-only NAT64/464XLAT: `ipconfig getifaddr en0` on the Mac reports `192.0.0.2`
+(the standard CLAT placeholder) instead of a real LAN address, and mDNS does not
+resolve Mac → Pi over it either. Toggling "Maximize Compatibility" and fully
+restarting the hotspot from both ends did **not** fix it -- this may just be how
+this pairing behaves.
+
+The fix in place: `PIZERO2W_USE_SSH_TUNNEL="1"` in `config/targets.local.env`
+makes the launcher open `ssh -N -R 8765:localhost:8765` before each session
+(`scripts/lib/tunnel.sh`), and the endpoint's systemd unit always dials its own
+`ws://127.0.0.1:8765` rather than a Mac IP. SSH itself connects reliably
+regardless of the hotspot's addressing mode, so this sidesteps IP discovery
+entirely. To test the tunnel by hand outside the launcher:
+
+```bash
+# [Mac] open and leave running
+ssh -N -R 8765:localhost:8765 voice-assistant-pizero2w
+
+# [Pi] point the client at its own loopback
+ssh voice-assistant-pizero2w "cd ~/voice-assistant-piZero2W && .venv/bin/python zero2w_client.py ws://127.0.0.1:8765 --debug"
+```
+
+If a genuinely routable IPv4 ever becomes available on this network, set
+`PIZERO2W_USE_SSH_TUNNEL="0"` and change the unit's `ExecStart` back to a Mac
+IP -- but confirm with `ipconfig getifaddr en0` first; a `192.0.0.2` result
+means the tunnel is still needed.
+
 ### Missing ALSA card
 **[Pi]**
 ```bash
@@ -673,10 +709,10 @@ device.
 | Amplifier pops on stream open/close | **VERIFIED** (kernel log) |
 | Two sound cards exist, so index 0 is not stable | **VERIFIED** |
 | User is in the `audio` group | **VERIFIED** |
-| Lingering is currently **disabled** | **VERIFIED** |
-| No endpoint repo exists on the Pi Zero 2 W | **VERIFIED** (absent) |
-| No systemd service exists on the Pi Zero 2 W | **VERIFIED** (absent) |
-| Pi Zero lacks `websockets` / `numpy` / `sounddevice` | **VERIFIED** (absent) |
+| Lingering is enabled | **VERIFIED** (`loginctl enable-linger` run 2026-07-22) |
+| Endpoint repo cloned, systemd service installed + enabled | **VERIFIED** (2026-07-22) |
+| Mac hotspot IP is IPv6-only NAT64/CLAT; SSH reverse tunnel required | **VERIFIED** (2026-07-22, see Troubleshooting) |
+| Pi Zero lacks `websockets` / `numpy` / `sounddevice` | **VERIFIED** (absent, at initial bring-up) |
 | Playback gain `0.35` is comfortable | **ASSUMED** — from earlier manual SoX testing, not re-measured |
 | Input gain `1.0` is correct | **ASSUMED** — placeholder; tune by ear |
 | Pi 5 audio hardware, ALSA device, channel layout | **UNVERIFIED** — Pi 5 was unreachable; deliberately left blank |

@@ -122,36 +122,89 @@ service_restart() {
   log_ok "Restart issued"
 }
 
-# Confirm systemd considers the unit active. Necessary but not sufficient --
-# service_wait_ready() is what actually proves the endpoint works.
-service_assert_active() {
-  is_dry_run && { log_info "[dry-run] would verify the unit is active"; return 0; }
+# Stop the endpoint service. Idempotent: inactive/not-found is success.
+service_stop() {
+  log_step "Stopping endpoint service on ${TARGET_NAME}"
+  log_info "Unit  : ${TARGET_SERVICE_NAME}.service (${TARGET_SERVICE_SCOPE} scope)"
 
-  local state
+  if is_dry_run; then
+    log_info "[dry-run] would run: $(_systemctl) stop ${TARGET_SERVICE_NAME}"
+    log_info "[dry-run] no service is touched"
+    return 0
+  fi
+
+  if ! ssh_is_reachable; then
+    log_warn "SSH to '${TARGET_SSH_HOST}' failed -- cannot stop the remote service."
+    log_dim "If the Pi is powered off, the service is already down."
+    return 0
+  fi
+
+  local state out
   state="$(ssh_run "$(_systemctl) is-active $(shq "${TARGET_SERVICE_NAME}") 2>&1" || true)"
-  if [[ "${state}" != "active" ]]; then
-    log_error "Service '${TARGET_SERVICE_NAME}' is not active (state: ${state})."
-    service_show_logs 50
-    die "The endpoint service did not stay running on ${TARGET_NAME}." \
-      "A unit that starts and immediately exits usually means the ExecStart" \
-      "command is wrong, or a Python dependency is missing on the Pi." \
+  if [[ "${state}" == "inactive" || "${state}" == "failed" || "${state}" == "unknown" ]]; then
+    log_ok "Service already stopped (state: ${state})"
+    return 0
+  fi
+
+  if ! out="$(ssh_run "$(_systemctl) stop $(shq "${TARGET_SERVICE_NAME}")" 2>&1)"; then
+    # Unit missing is fine for terminate -- nothing to stop.
+    if printf '%s\n' "${out}" | grep -qiE 'not found|could not be found|Unit .* not loaded'; then
+      log_ok "Service unit not installed -- nothing to stop"
+      return 0
+    fi
+    die "Failed to stop '${TARGET_SERVICE_NAME}' on ${TARGET_NAME}." \
+      "$(printf '%s\n' "${out}" | sed 's/^/  /')" \
       "" \
       "Inspect:  ssh ${TARGET_SSH_HOST} '$(_systemctl) status ${TARGET_SERVICE_NAME} --no-pager -l'"
   fi
-  log_ok "Service is active"
+
+  state="$(ssh_run "$(_systemctl) is-active $(shq "${TARGET_SERVICE_NAME}") 2>&1" || true)"
+  if [[ "${state}" == "inactive" || "${state}" == "failed" ]]; then
+    log_ok "Service stopped"
+  else
+    log_warn "Stop issued, but state is still '${state}'"
+  fi
 }
 
-# Step 8: wait for the endpoint to actually be ready.
-#
-# Note the direction of this protocol: the APP is the WebSocket server and the
-# PI is the client that dials in (see src/voice_assistant/transport/
-# websocket_transport.py). So there is no port to poll on the Pi -- "ready"
-# means the endpoint process came up, stayed up, and is dialling the Mac.
-#
-# Restart-loop detection is what makes this more than a process-exists check: a
-# unit that crashes and respawns reports "active" at almost any instant, so the
-# restart counter is sampled over time and a climbing count is treated as
-# failure. Definitive proof is the HELLO handshake, verified in app.sh.
+# Confirm systemd considers the unit active. Necessary but not sufficient --
+# the endpoint is a client that cannot connect until the app (started later)
+# is listening, so the definitive proof is the HELLO handshake, verified by the
+# watchdog in start_local_app. See the ordering note in start-target.sh.
+service_assert_active() {
+  is_dry_run && { log_info "[dry-run] would verify the unit is active"; return 0; }
+
+  # "activating" is normal right after restart AND during RestartSec when the
+  # unit is about to auto-restart (e.g. endpoint briefly failed to dial before
+  # the Mac app is listening). Wait through that window rather than treating
+  # the first few seconds as a hard failure.
+  local state attempt
+  local max_attempts="${TARGET_READY_TIMEOUT:-30}"
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    state="$(ssh_run "$(_systemctl) is-active $(shq "${TARGET_SERVICE_NAME}") 2>&1" || true)"
+    [[ "${state}" == "active" ]] && { log_ok "Service is active"; return 0; }
+    if [[ "${state}" != "activating" ]]; then
+      break
+    fi
+    sleep 1
+  done
+
+  log_error "Service '${TARGET_SERVICE_NAME}' is not active (state: ${state})."
+  service_show_logs 50
+  die "The endpoint service did not stay running on ${TARGET_NAME}." \
+    "A unit that starts and immediately exits usually means the ExecStart" \
+    "command is wrong, a Python dependency is missing on the Pi, or (with" \
+    "an SSH tunnel) the endpoint is crashing on connect instead of retrying." \
+    "" \
+    "Inspect:  ssh ${TARGET_SSH_HOST} '$(_systemctl) status ${TARGET_SERVICE_NAME} --no-pager -l'"
+}
+
+# Retained for reference / manual use, but NOT called in the default launch
+# flow -- see the ordering note in start-target.sh. Because the endpoint dials
+# the app and the app starts last, the endpoint legitimately fails to connect
+# (and may restart) until the app is listening; treating those restarts as a
+# crash-loop would abort every launch before the app ever starts. The endpoint's
+# own reconnect backoff bridges that gap instead, and the HELLO handshake
+# (verified in app.sh) is the real readiness signal.
 service_wait_ready() {
   if is_dry_run; then
     log_step "Endpoint readiness"
@@ -180,7 +233,15 @@ service_wait_ready() {
         "    $(service_logs_command)"
     fi
 
-    if [[ "${restarts_now}" -gt "${restarts_start}" ]]; then
+    # A climbing restart counter usually means crash-loop. With an SSH reverse
+    # tunnel the endpoint may still be dialling before the Mac app listens;
+    # allow activating/auto-restart samples without treating them as failure
+    # until we have seen a sustained active window (below). Only fail fast on
+    # restart storms when the unit is not even managing to stay active.
+    if [[ "${restarts_now}" -gt "${restarts_start}" && "${state}" == "active" ]]; then
+      # Process is up; a prior restart during this wait is fine.
+      :
+    elif [[ "${restarts_now}" -gt $((restarts_start + 3)) && "${state}" != "active" ]]; then
       log_error "Service '${TARGET_SERVICE_NAME}' is restarting repeatedly" \
         "(NRestarts went ${restarts_start} -> ${restarts_now})."
       service_show_logs 50
@@ -192,7 +253,7 @@ service_wait_ready() {
         "    $(service_logs_command)"
     fi
 
-    # Stayed up, no new restarts, for two consecutive samples.
+    # Stayed up, no new restarts in this sample window, for two consecutive samples.
     if [[ "${state}" == "active" && ${elapsed} -ge ${interval} ]]; then
       log_ok "Endpoint is up and stable (no restarts in ${elapsed}s)"
       log_dim "Definitive proof is the HELLO handshake, verified once the app starts."

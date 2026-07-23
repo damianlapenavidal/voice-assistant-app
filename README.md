@@ -60,12 +60,18 @@ One command per target, from the repo root on the Mac:
 
 ./scripts/start-pi5.sh              # Raspberry Pi 5
 ./scripts/start-pizero2w.sh         # Raspberry Pi Zero 2 W
+
+./scripts/terminate-pi5.sh          # stop Pi service + Mac app + tunnels
+./scripts/terminate-pizero2w.sh
 ```
 
 Each launcher checks SSH before touching Wi-Fi, switches the Mac to the target's
 saved network only when needed, updates the Pi with `git pull --ff-only` (never
 destructively), runs a silent ALSA preflight, restarts the endpoint service, waits
 for it to be ready, and then starts this app with that target selected.
+
+`Ctrl+C` in the start terminal stops the Mac app (and tunnel) but leaves the Pi
+service running. Use `terminate-*` to tear down the full session.
 
 ```bash
 ./scripts/start-pizero2w.sh --dry-run   # show every step, change nothing
@@ -96,10 +102,13 @@ scripts/                     # Mac-side launch + deploy workflow
   start-pi5.sh               # wrapper -> start-target.sh pi5
   start-pizero2w.sh          # wrapper -> start-target.sh pizero2w
   start-target.sh            # the shared launch implementation
+  terminate-pi5.sh           # wrapper -> stop-target.sh pi5
+  terminate-pizero2w.sh      # wrapper -> stop-target.sh pizero2w
+  stop-target.sh             # stop Pi service, Mac app, orphan tunnels
   setup-target-config.sh     # creates config/targets.local.env, lists SSIDs
   audio-diagnostic.sh        # explicit, opt-in mic/speaker tests
   lib/                       # common, config, network, ssh, deploy, audio,
-                             #   service, app
+                             #   service, app, tunnel
 config/
   targets.example.env        # committed, secret-free target template
 deploy/systemd/              # endpoint service templates (installed on a Pi)
