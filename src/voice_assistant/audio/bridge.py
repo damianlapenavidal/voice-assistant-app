@@ -551,6 +551,7 @@ class AudioBridge:
             "audio_bridge.calibration_complete",
             noise_floor=noise_floor,
             user_speech_peak=user_speech_peak,
+            vad_eagerness=vad_settings.eagerness,
             vad_threshold=vad_settings.threshold,
             silence_ms=vad_settings.silence_ms,
         )
@@ -570,6 +571,13 @@ class AudioBridge:
             await self._begin_openai_conversation()
         else:
             self._set_conversation_state("listening")
+            # The device only starts streaming AUDIO_FRAMEs once it sees
+            # UNMUTE_MIC (or a skip_calibration resume) -- see
+            # zero2w_client.py/pi5_client.py's `_stream_to_laptop` gate. The
+            # non-loopback path sends this implicitly once the opening
+            # greeting finishes playing; loopback has no greeting, so without
+            # this the device stays muted forever after a fresh calibration.
+            await self._send_mute(False)
         return True
 
     async def _begin_openai_conversation(self) -> None:

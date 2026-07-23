@@ -19,6 +19,7 @@ class MessageType(str, Enum):
     AUDIO_FRAME = "AUDIO_FRAME"
     PLAY_AUDIO = "PLAY_AUDIO"
     SET_VOLUME = "SET_VOLUME"
+    SET_MIC_GAIN = "SET_MIC_GAIN"
     SHUTDOWN_DEVICE = "SHUTDOWN_DEVICE"
     MUTE_MIC = "MUTE_MIC"
     UNMUTE_MIC = "UNMUTE_MIC"
@@ -78,6 +79,10 @@ class PlaybackCompletePayload(BaseModel):
 
 class SetVolumePayload(BaseModel):
     volume: int = Field(ge=0, le=100)
+
+
+class SetMicGainPayload(BaseModel):
+    gain: int = Field(ge=0, le=100)
 
 
 class ErrorPayload(BaseModel):

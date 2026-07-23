@@ -23,3 +23,13 @@ class TestDeriveVadSettings:
     def test_prefix_padding_is_stable(self) -> None:
         settings = derive_vad_settings(noise_floor=400.0, user_speech_peak=700.0)
         assert settings.prefix_padding_ms == 300
+
+    def test_stays_patient_in_normal_rooms(self) -> None:
+        quiet = derive_vad_settings(noise_floor=200.0, user_speech_peak=900.0)
+        moderate = derive_vad_settings(noise_floor=600.0, user_speech_peak=1000.0)
+        assert quiet.eagerness == "low"
+        assert moderate.eagerness == "low"
+
+    def test_loud_room_grows_more_eager(self) -> None:
+        loud = derive_vad_settings(noise_floor=900.0, user_speech_peak=1200.0)
+        assert loud.eagerness == "medium"

@@ -207,6 +207,46 @@
   .btn-turnon:hover:not(:disabled) { opacity: 0.9; }
   .btn[hidden] { display: none; }
 
+  .volume-control { margin-top: 16px; }
+
+  .volume-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.85rem;
+    font-weight: 500;
+    margin-bottom: 8px;
+  }
+
+  input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--surface2);
+    outline: none;
+  }
+
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    border: none;
+  }
+
+  input[type="range"]::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    border: none;
+  }
+
   .transcript-area {
     max-height: 260px;
     overflow-y: auto;
@@ -256,6 +296,43 @@
     font-size: 0.85rem;
     text-align: center;
     padding: 20px;
+  }
+
+  .level-meter-wrap { margin-top: 14px; }
+
+  .level-meter-label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+  }
+
+  .clip-badge {
+    display: none;
+    color: var(--red);
+    font-weight: 700;
+    letter-spacing: 0.05em;
+  }
+
+  .clip-badge.active { display: inline-block; }
+
+  .level-meter-track {
+    height: 10px;
+    border-radius: 6px;
+    background: var(--surface2);
+    overflow: hidden;
+  }
+
+  .level-meter-fill {
+    height: 100%;
+    width: 0%;
+    border-radius: 6px;
+    background: linear-gradient(90deg, var(--green), var(--yellow) 70%, var(--red) 92%);
+    transition: width 0.08s linear;
   }
 
   .ws-status {
@@ -328,6 +405,15 @@
         <div class="stat-value" id="uptime">—</div>
       </div>
     </div>
+    <div class="level-meter-wrap">
+      <div class="level-meter-label">
+        <span>Mic Level</span>
+        <span class="clip-badge" id="levelClipBadge">CLIPPING</span>
+      </div>
+      <div class="level-meter-track">
+        <div class="level-meter-fill" id="levelMeterFill"></div>
+      </div>
+    </div>
   </div>
 
   <div class="card">
@@ -339,6 +425,22 @@
       <button class="btn btn-resume" id="btnResume" onclick="sendAction('resume_session')" hidden>Resume</button>
       <button class="btn btn-stop" id="btnStop" onclick="sendAction('stop_session')">Stop Session</button>
       <button class="btn btn-shutdown" id="btnShutdown" onclick="sendAction('shutdown')">Shutdown</button>
+    </div>
+    <div class="volume-control">
+      <div class="volume-label">
+        <span>Speaker Volume</span>
+        <span id="volumeValue">35%</span>
+      </div>
+      <input type="range" min="0" max="100" value="35" id="volumeSlider"
+             oninput="onVolumeInput(this.value)" onchange="sendVolume(this.value)">
+    </div>
+    <div class="volume-control">
+      <div class="volume-label">
+        <span>Mic Sensitivity</span>
+        <span id="micGainValue">40%</span>
+      </div>
+      <input type="range" min="0" max="100" value="40" id="micGainSlider"
+             oninput="onMicGainInput(this.value)" onchange="sendMicGain(this.value)">
     </div>
   </div>
 
@@ -433,10 +535,12 @@
       updateSessionState('ACTIVE');
       updateConversationState('idle');
       updateMicMuted(false);
+      updateAudioLevel(0, false);
     } else if (event === 'session_shutdown' || event === 'device_disconnected') {
       updateConnectionStatus(false);
       updateSessionState(event === 'session_shutdown' ? 'SHUTDOWN' : 'IDLE');
       updateConversationState('idle');
+      updateAudioLevel(0, false);
     } else if (event === 'device_turning_on') {
       updateSessionState('CONNECTING');
       updateConversationState('idle');
@@ -446,9 +550,13 @@
       updateMicMuted(data.muted);
       if (data.muted) {
         updateConversationState('ai_speaking');
+        updateAudioLevel(0, false);
       } else {
         updateConversationState('listening');
       }
+    } else if (event === 'audio_level') {
+      updateAudioLevel(data.level || 0, data.clipping || false);
+      return;
     } else if (event === 'transcript') {
       updateTranscript(data.role, data.text, data.final);
       return;
@@ -563,6 +671,12 @@
     }
   }
 
+  function updateAudioLevel(level, clipping) {
+    const pct = Math.max(0, Math.min(1, level)) * 100;
+    document.getElementById('levelMeterFill').style.width = pct + '%';
+    document.getElementById('levelClipBadge').classList.toggle('active', !!clipping);
+  }
+
   function updateTranscript(role, text, final) {
     if (role === 'assistant' && !final) {
       const area = document.getElementById('transcriptArea');
@@ -622,6 +736,26 @@
   function sendAction(action) {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ action }));
+    }
+  }
+
+  function onVolumeInput(value) {
+    document.getElementById('volumeValue').textContent = value + '%';
+  }
+
+  function sendVolume(value) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ action: 'set_volume', value: parseInt(value, 10) }));
+    }
+  }
+
+  function onMicGainInput(value) {
+    document.getElementById('micGainValue').textContent = value + '%';
+  }
+
+  function sendMicGain(value) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ action: 'set_mic_gain', value: parseInt(value, 10) }));
     }
   }
 

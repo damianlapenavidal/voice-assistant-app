@@ -241,6 +241,159 @@ class TestConversation:
             await sm.stop_conversation()
 
 
+class TestSetVolume:
+    """set_volume() sends SET_VOLUME (0-100), clamped, after handshake."""
+
+    async def test_set_volume_sends_message(self) -> None:
+        from voice_assistant.core.message import MessageType
+
+        t = MockTransport()
+        sm = SessionManager(t)
+        await sm.wait_for_device()
+
+        await sm.set_volume(70)
+
+        volume_msgs = [m for m in t.sent_messages if m.type == MessageType.SET_VOLUME]
+        assert len(volume_msgs) == 1
+        assert volume_msgs[0].payload == {"volume": 70}
+
+    async def test_set_volume_clamps_out_of_range(self) -> None:
+        from voice_assistant.core.message import MessageType
+
+        t = MockTransport()
+        sm = SessionManager(t)
+        await sm.wait_for_device()
+
+        await sm.set_volume(150)
+        await sm.set_volume(-20)
+
+        volume_msgs = [m for m in t.sent_messages if m.type == MessageType.SET_VOLUME]
+        assert volume_msgs[0].payload == {"volume": 100}
+        assert volume_msgs[1].payload == {"volume": 0}
+
+    async def test_set_volume_requires_handshake(self) -> None:
+        t = MockTransport()
+        sm = SessionManager(t)
+        with pytest.raises(TransportError):
+            await sm.set_volume(50)
+
+
+class TestSetMicGain:
+    """set_mic_gain() sends SET_MIC_GAIN (0-100), clamped, after handshake."""
+
+    async def test_set_mic_gain_sends_message(self) -> None:
+        from voice_assistant.core.message import MessageType
+
+        t = MockTransport()
+        sm = SessionManager(t)
+        await sm.wait_for_device()
+
+        await sm.set_mic_gain(40)
+
+        gain_msgs = [m for m in t.sent_messages if m.type == MessageType.SET_MIC_GAIN]
+        assert len(gain_msgs) == 1
+        assert gain_msgs[0].payload == {"gain": 40}
+
+    async def test_set_mic_gain_clamps_out_of_range(self) -> None:
+        from voice_assistant.core.message import MessageType
+
+        t = MockTransport()
+        sm = SessionManager(t)
+        await sm.wait_for_device()
+
+        await sm.set_mic_gain(150)
+        await sm.set_mic_gain(-20)
+
+        gain_msgs = [m for m in t.sent_messages if m.type == MessageType.SET_MIC_GAIN]
+        assert gain_msgs[0].payload == {"gain": 100}
+        assert gain_msgs[1].payload == {"gain": 0}
+
+    async def test_set_mic_gain_requires_handshake(self) -> None:
+        t = MockTransport()
+        sm = SessionManager(t)
+        with pytest.raises(TransportError):
+            await sm.set_mic_gain(50)
+
+
+class TestAudioLevelEmission:
+    """AUDIO_FRAME processing emits a lightweight audio_level event for the dashboard."""
+
+    async def test_audio_frame_emits_audio_level(self) -> None:
+        from voice_assistant.audio.utils import pcm16_to_base64
+        from voice_assistant.core.message import MessageType, create_message
+
+        t = MockTransport()
+        sm = SessionManager(t, loopback=True)
+        await sm.wait_for_device()
+        await sm.start_conversation()
+
+        events: list[tuple[str, dict]] = []
+        sm.add_event_listener(lambda e, d: events.append((e, d)))
+
+        loud_pcm = struct_pack_samples([30000, -30000, 100, -100])
+        frame_msg = create_message(
+            MessageType.AUDIO_FRAME,
+            {"audio": pcm16_to_base64(loud_pcm), "sequence_number": 1},
+        )
+        await sm._process_message(frame_msg, 1)
+
+        level_events = [d for e, d in events if e == "audio_level"]
+        assert len(level_events) == 1
+        assert level_events[0]["level"] == pytest.approx(30000 / 32767.0, abs=0.001)
+        assert level_events[0]["clipping"] is False
+
+    async def test_silent_frame_emits_zero_level(self) -> None:
+        from voice_assistant.audio.utils import pcm16_to_base64
+        from voice_assistant.core.message import MessageType, create_message
+
+        t = MockTransport()
+        sm = SessionManager(t, loopback=True)
+        await sm.wait_for_device()
+        await sm.start_conversation()
+
+        events: list[tuple[str, dict]] = []
+        sm.add_event_listener(lambda e, d: events.append((e, d)))
+
+        silent_pcm = struct_pack_samples([0, 0, 0, 0])
+        frame_msg = create_message(
+            MessageType.AUDIO_FRAME,
+            {"audio": pcm16_to_base64(silent_pcm), "sequence_number": 1},
+        )
+        await sm._process_message(frame_msg, 1)
+
+        level_events = [d for e, d in events if e == "audio_level"]
+        assert level_events[0]["level"] == 0.0
+        assert level_events[0]["clipping"] is False
+
+    async def test_full_scale_frame_flags_clipping(self) -> None:
+        from voice_assistant.audio.utils import pcm16_to_base64
+        from voice_assistant.core.message import MessageType, create_message
+
+        t = MockTransport()
+        sm = SessionManager(t, loopback=True)
+        await sm.wait_for_device()
+        await sm.start_conversation()
+
+        events: list[tuple[str, dict]] = []
+        sm.add_event_listener(lambda e, d: events.append((e, d)))
+
+        clipped_pcm = struct_pack_samples([32767, -32768])
+        frame_msg = create_message(
+            MessageType.AUDIO_FRAME,
+            {"audio": pcm16_to_base64(clipped_pcm), "sequence_number": 1},
+        )
+        await sm._process_message(frame_msg, 1)
+
+        level_events = [d for e, d in events if e == "audio_level"]
+        assert level_events[0]["clipping"] is True
+
+
+def struct_pack_samples(samples: list[int]) -> bytes:
+    import struct
+
+    return struct.pack(f"<{len(samples)}h", *samples)
+
+
 class TestSessionLoop:
     """run_session_loop() runs through a complete mock lifecycle."""
 

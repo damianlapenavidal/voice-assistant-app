@@ -385,6 +385,37 @@ Adjusts the device's speaker volume.
 
 ---
 
+#### `SET_MIC_GAIN`
+
+Adjusts the device's microphone input gain.
+
+**Payload:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `gain` | integer | Gain level from 0 to 100 |
+
+`gain` is a percentage of the device's configured `MAX_INPUT_GAIN`, not a
+direct multiplier — a device with `MAX_INPUT_GAIN=50.0` maps `gain: 100` to an
+actual capture-stage multiplier of 50.0x. This lets each board expose its own
+verified headroom (raw mic signal level varies by hardware) behind the same
+0-100 dashboard control. Applied live to the next captured chunk; capture does
+not restart.
+
+**Example:**
+
+```json
+{
+  "type": "SET_MIC_GAIN",
+  "payload": {
+    "gain": 40
+  },
+  "timestamp": "2026-06-30T15:00:02.000Z"
+}
+```
+
+---
+
 #### `SHUTDOWN_DEVICE`
 
 Instructs the device to safely power off.

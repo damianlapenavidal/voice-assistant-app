@@ -110,13 +110,11 @@ class TestRealtimeClientConnect:
         assert session["model"] == DEFAULT_OPENAI_MODEL
         assert session["instructions"] == load_system_instructions("oso_animals")
         assert session["audio"]["input"]["format"]["rate"] == 24000
-        assert session["audio"]["input"]["turn_detection"]["type"] == "server_vad"
+        assert session["audio"]["input"]["turn_detection"]["type"] == "semantic_vad"
         vad = session["audio"]["input"]["turn_detection"]
         assert vad["create_response"] is True
         assert vad["interrupt_response"] is True
-        assert 0.35 <= vad["threshold"] <= 0.85
-        assert vad["silence_duration_ms"] >= 650
-        assert vad["prefix_padding_ms"] == 300
+        assert vad["eagerness"] in {"low", "medium", "high", "auto"}
         assert session["audio"]["output"]["voice"] == "alloy"
 
         await client.disconnect()
@@ -281,7 +279,7 @@ class TestRealtimeClientEvents:
         ]
         assert len(session_updates) == 2
         latest = session_updates[-1]["session"]["audio"]["input"]["turn_detection"]
-        assert latest["threshold"] == settings.threshold
+        assert latest["eagerness"] == settings.eagerness
         await client.disconnect()
 
     async def test_output_audio_delta(

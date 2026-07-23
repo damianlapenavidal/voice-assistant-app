@@ -103,6 +103,9 @@ load_target_config() {
   TARGET_ENDPOINT_PORT="$(_cfg "${p}" ENDPOINT_PORT)"; : "${TARGET_ENDPOINT_PORT:=8765}"
   TARGET_PROTOCOL="$(_cfg "${p}" PROTOCOL)"; : "${TARGET_PROTOCOL:=websocket}"
   TARGET_READY_TIMEOUT="$(_cfg "${p}" READY_TIMEOUT)"; : "${TARGET_READY_TIMEOUT:=30}"
+  # "1" -> carry the WebSocket connection over an SSH -R tunnel instead of
+  # having the Pi dial the Mac's LAN IP. See scripts/lib/tunnel.sh for why.
+  TARGET_USE_SSH_TUNNEL="$(_cfg "${p}" USE_SSH_TUNNEL)"; : "${TARGET_USE_SSH_TUNNEL:=0}"
 
   # --- Audio (optional; empty means "not verified for this board") ---
   TARGET_ALSA_CARD_ID="$(_cfg "${p}" ALSA_CARD_ID)"
@@ -142,6 +145,9 @@ print_target_config() {
   log_info "Branch         : ${TARGET_BRANCH}"
   log_info "Service        : ${TARGET_SERVICE_NAME} (${TARGET_SERVICE_SCOPE} scope)"
   log_info "Protocol       : ${TARGET_PROTOCOL} on port ${TARGET_ENDPOINT_PORT}"
+  if [[ "${TARGET_USE_SSH_TUNNEL}" == "1" ]]; then
+    log_info "Connection     : SSH reverse tunnel (this Mac's IP is not reachable over ${TARGET_NAME}'s network)"
+  fi
   if target_has_audio_config; then
     log_info "ALSA card      : ${TARGET_ALSA_CARD_ID}"
     log_info "Capture        : ${TARGET_CAPTURE_DEVICE}"

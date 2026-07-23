@@ -85,6 +85,23 @@ def likely_calibration_prompt_transcript(text: str) -> bool:
     )
 
 
+def compute_audio_level(pcm_bytes: bytes) -> tuple[float, bool]:
+    """Return (peak level 0.0-1.0, clipping) for a PCM16 little-endian chunk.
+
+    Used to drive the dashboard's live volume meter; not part of the audio
+    pipeline itself. ``clipping`` flags samples sitting at (or essentially at)
+    full scale, since that's the level a gain setting should stay under.
+    """
+    if not pcm_bytes:
+        return 0.0, False
+    count = len(pcm_bytes) // 2
+    if count == 0:
+        return 0.0, False
+    samples = struct.unpack(f"<{count}h", pcm_bytes[: count * 2])
+    peak = max(abs(s) for s in samples)
+    return peak / 32767.0, peak >= 32760
+
+
 def generate_test_tone(
     duration_ms: int,
     frequency: int = 440,

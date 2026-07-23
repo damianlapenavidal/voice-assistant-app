@@ -29,6 +29,8 @@ source "${SCRIPT_DIR}/lib/config.sh"
 source "${SCRIPT_DIR}/lib/network.sh"
 # shellcheck source=lib/ssh.sh
 source "${SCRIPT_DIR}/lib/ssh.sh"
+# shellcheck source=lib/tunnel.sh
+source "${SCRIPT_DIR}/lib/tunnel.sh"
 # shellcheck source=lib/deploy.sh
 source "${SCRIPT_DIR}/lib/deploy.sh"
 # shellcheck source=lib/audio.sh
@@ -109,6 +111,7 @@ fi
 cleanup() {
   local rc=$?
   stop_handshake_watchdog
+  stop_reverse_tunnel
   return ${rc}
 }
 trap cleanup EXIT
@@ -182,6 +185,11 @@ else
   DRY_RUN_OFFLINE=0
 fi
 
+# --- SSH reverse tunnel (opt-in per target) --------------------------------
+if [[ "${DRY_RUN_OFFLINE}" != "1" ]]; then
+  start_reverse_tunnel
+fi
+
 # --- Step 5: deploy --------------------------------------------------------
 if [[ ${SKIP_PULL} -eq 1 ]]; then
   log_step "Updating repository on ${TARGET_NAME}"
@@ -204,14 +212,21 @@ else
   audio_preflight
 fi
 
-# --- Steps 7 and 8: endpoint ----------------------------------------------
+# --- Step 7: endpoint ------------------------------------------------------
+# NOTE ON ORDERING: the endpoint is a CLIENT that dials the app (the server),
+# and the app is started last (below). So the endpoint cannot connect -- and a
+# --logs-free launch cannot "wait for it to be ready" -- until the app is up.
+# The endpoint handles exactly this with its own reconnect backoff
+# (MAX_RECONNECT_ATTEMPTS in zero2w_client.py): it retries while the app boots
+# and connects on a later attempt. We therefore only confirm the unit launched
+# (service_assert_active); the definitive readiness signal is the HELLO
+# handshake, verified by the watchdog in start_local_app once the app listens.
 if [[ "${DRY_RUN_OFFLINE}" == "1" ]]; then
   log_step "Restarting endpoint service on ${TARGET_NAME}"
   log_info "[dry-run] would run: $(_systemctl) restart ${TARGET_SERVICE_NAME}"
 else
   service_restart
   service_assert_active
-  service_wait_ready
 fi
 
 # --- --logs mode -----------------------------------------------------------

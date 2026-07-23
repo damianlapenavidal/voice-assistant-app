@@ -83,6 +83,31 @@ class TestLoopbackRelay:
         assert sent_msg.payload["audio"] == audio
         assert sent_msg.payload["sequence_number"] == 42
 
+    async def test_calibration_complete_sends_unmute_so_device_starts_streaming(
+        self,
+    ) -> None:
+        """The device (pi5_client.py/zero2w_client.py) only flips its
+        `_stream_to_laptop` gate on `skip_calibration` resume or on receiving
+        UNMUTE_MIC. Loopback has no opening-greeting mute/unmute cycle, so
+        without an explicit UNMUTE_MIC here the device stays silent forever
+        after a fresh (non-resumed) calibration.
+        """
+        transport = _make_mock_transport()
+        bridge = AudioBridge(transport, loopback=True)
+        bridge.set_device_ready(True)
+        bridge.start()
+
+        await bridge.handle_calibration_complete({
+            "noise_floor": 350.0,
+            "user_speech_peak": 850.0,
+        })
+
+        unmute_calls = [
+            c for c in transport.send_message.call_args_list
+            if c[0][0].type == MessageType.UNMUTE_MIC
+        ]
+        assert len(unmute_calls) == 1
+
     async def test_multiple_frames_increment_count(self) -> None:
         transport = _make_mock_transport()
         bridge = AudioBridge(transport, loopback=True)

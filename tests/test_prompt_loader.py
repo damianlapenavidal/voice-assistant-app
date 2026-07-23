@@ -32,10 +32,13 @@ def isolated_env(monkeypatch):
 class TestLoadPrompt:
     def test_loads_bundled_prompts(self) -> None:
         assert load_prompt("base_system").strip()
+        assert load_prompt("teaching_method").strip()
         assert load_prompt("opening_greeting").strip()
         assert load_prompt("personas/oso_animals").strip()
         assert load_prompt("personas/chef_coco_food").strip()
         assert load_prompt("personas/robi_colors").strip()
+        assert load_prompt("personas/luna_bedtime").strip()
+        assert load_prompt("personas/pili_movement").strip()
 
     def test_strips_surrounding_whitespace(self) -> None:
         text = load_prompt("opening_greeting")
@@ -47,15 +50,31 @@ class TestLoadPrompt:
 
 
 class TestLoadSystemInstructions:
-    def test_composes_base_and_persona(self) -> None:
+    def test_composes_base_method_and_persona(self) -> None:
         base = load_prompt("base_system")
+        method = load_prompt("teaching_method")
         persona = load_prompt("personas/oso_animals")
         composed = load_system_instructions("oso_animals")
 
         assert base in composed
+        assert method in composed
         assert persona in composed
-        # Base comes first, persona second, separated by a blank line.
-        assert composed == f"{base}\n\n{persona}"
+        # Order: base identity, then shared teaching method, then persona,
+        # each separated by a blank line.
+        assert composed == f"{base}\n\n{method}\n\n{persona}"
+
+    def test_shared_method_present_in_every_persona(self) -> None:
+        # The teaching method is the same across personas, so a distinctive
+        # marker from it should appear in each composed prompt.
+        marker = "spaced repetition"
+        for persona_id in (
+            "oso_animals",
+            "robi_colors",
+            "chef_coco_food",
+            "luna_bedtime",
+            "pili_movement",
+        ):
+            assert marker in load_system_instructions(persona_id)
 
     def test_different_personas_differ(self) -> None:
         oso = load_system_instructions("oso_animals")

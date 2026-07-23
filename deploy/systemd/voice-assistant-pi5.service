@@ -3,21 +3,16 @@
 # INSTALL ON: the Pi 5 (not the Mac).
 #     mkdir -p ~/.config/systemd/user
 #     cp deploy/systemd/voice-assistant-pi5.service ~/.config/systemd/user/
-#     # edit ExecStart AND the audio settings, then:
 #     systemctl --user daemon-reload
 #     systemctl --user enable --now voice-assistant-pi5
 #     loginctl enable-linger "$(id -un)"
 #
-# !! UNVERIFIED. The Pi 5 was not reachable when this template was written, so
-# !! neither its entrypoint nor its audio hardware could be inspected. Nothing
-# !! here is copied from the Pi Zero 2 W on purpose -- the two boards must not
-# !! be assumed to share a sound card, device string, or channel layout.
-# !!
-# !! Before enabling, ON THE PI 5:
-# !!     cat /proc/asound/cards
-# !!     arecord -l ; aplay -l ; aplay -L
-# !! then fill in the Environment= lines below and the matching PI5_* keys in
-# !! voice-assistant-app/config/targets.local.env.
+# The endpoint dials ws://127.0.0.1:8765 (its own loopback). Pair with
+# PI5_USE_SSH_TUNNEL="1" in config/targets.local.env so the Mac launcher opens
+# `ssh -R 8765:localhost:8765` before starting the app.
+#
+# ALSA device settings still live in the endpoint's own .env / EnvironmentFile;
+# fill PI5_* ALSA keys in targets.local.env once verified on this board.
 
 [Unit]
 Description=Voice Assistant audio endpoint (Raspberry Pi 5)
@@ -27,32 +22,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/voice-assistant-pi5
+WorkingDirectory=%h/voice-assistant-pi5/device
+ExecStart=%h/voice-assistant-pi5/.venv/bin/python %h/voice-assistant-pi5/device/pi5_client.py ws://127.0.0.1:8765
 
-Environment=VOICE_ASSISTANT_TARGET=pi5
-
-# UNVERIFIED -- fill in from `aplay -L` on the Pi 5. Always address the card by
-# ID (CARD=<id>), never by numeric index: indexes move when cards are added.
-#Environment=VOICE_ASSISTANT_ALSA_CARD_ID=<verify-on-pi5>
-#Environment=VOICE_ASSISTANT_CAPTURE_DEVICE=plughw:CARD=<verify-on-pi5>,DEV=0
-#Environment=VOICE_ASSISTANT_PLAYBACK_DEVICE=plughw:CARD=<verify-on-pi5>,DEV=0
-#Environment=VOICE_ASSISTANT_AUDIO_SAMPLE_RATE=<verify-on-pi5>
-#Environment=VOICE_ASSISTANT_CAPTURE_FORMAT=<verify-on-pi5>
-#Environment=VOICE_ASSISTANT_CAPTURE_CHANNELS=<verify-on-pi5>
-#Environment=VOICE_ASSISTANT_MIC_CHANNEL=<verify-on-pi5>
-#Environment=VOICE_ASSISTANT_PLAYBACK_CHANNELS=<verify-on-pi5>
-#Environment=VOICE_ASSISTANT_INPUT_GAIN=1.0
-#Environment=VOICE_ASSISTANT_PLAYBACK_GAIN=<verify-on-pi5>
-
-EnvironmentFile=-%h/.config/voice-assistant-pi5.env
-
-# PLACEHOLDER -- replace with the endpoint's real entrypoint.
-ExecStart=/usr/bin/false "Set ExecStart in ~/.config/systemd/user/voice-assistant-pi5.service"
-
-Restart=on-failure
-RestartSec=5
-StartLimitBurst=5
-StartLimitIntervalSec=300
+# always: pi5_client exits 0 after a few refused connects while the Mac app is
+# not listening yet; on-failure would leave the unit dead in that window.
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
 
 StandardOutput=journal
 StandardError=journal

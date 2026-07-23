@@ -91,9 +91,9 @@ for setup, the verified Pi Zero 2 W audio configuration, and troubleshooting.
 
 ## Project Status
 
-**Phase 0 -- Planning and Setup**
-
-The project is in its initial setup phase. The folder structure, dependencies, and architecture documentation are being established. See the [phased roadmap](docs/roadmap.md) for the full development plan.
+Working Mac + Raspberry Pi voice assistant with OpenAI Realtime, bilingual
+persona prompts, parent web dashboard, and Mac-side deploy/terminate scripts
+for the Pi 5 and Pi Zero 2 W.
 
 ## Folder Structure
 
@@ -127,13 +127,14 @@ src/voice_assistant/
   audio/
     utils.py                 # Audio format helpers (PCM, base64, resampling)
 tests/                       # Unit and integration tests
-docs/                        # Architecture docs, protocol spec, roadmap
+docs/                        # Architecture, protocol, Pi workflow, learning design
 ```
 
 ## Documentation
 
 See the [docs/](docs/) directory for detailed documentation:
 
-- Architecture design and diagrams
-- Device-app protocol specification
-- Phased development roadmap
+- [Architecture](docs/architecture.md) — system layers and design
+- [Protocol](docs/protocol.md) — device ↔ app message contract
+- [Raspberry Pi workflow](docs/raspberry-pi-development-workflow.md) — launch, deploy, audio
+- [Learning design](docs/learning-design.md) — bilingual teaching pedagogy and prompts

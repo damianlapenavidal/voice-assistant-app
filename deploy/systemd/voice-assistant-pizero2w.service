@@ -1,9 +1,8 @@
-# Raspberry Pi Zero 2 W audio endpoint -- USER service template.
+# Raspberry Pi Zero 2 W audio endpoint -- USER service.
 #
 # INSTALL ON: the Pi Zero 2 W (not the Mac).
 #     mkdir -p ~/.config/systemd/user
 #     cp deploy/systemd/voice-assistant-pizero2w.service ~/.config/systemd/user/
-#     # edit ExecStart to the endpoint's real entrypoint, then:
 #     systemctl --user daemon-reload
 #     systemctl --user enable --now voice-assistant-pizero2w
 #     loginctl enable-linger "$(id -un)"     # survive SSH logout + start at boot
@@ -12,10 +11,11 @@
 # requires a passwordless-sudo grant. The endpoint only needs the `audio` group
 # (already granted) to reach /dev/snd -- it does not need root.
 #
-# !! ExecStart below is a PLACEHOLDER. As of this template's writing the
-# !! voice-assistant-piZero2W repository had not yet been cloned onto the
-# !! device and no endpoint entrypoint existed, so no command could be
-# !! verified. Set ExecStart to the endpoint's real entrypoint before enabling.
+# Audio device config (AUDIO_INPUT_DEVICE, INPUT_GAIN, etc.) is NOT set here --
+# zero2w_client.py loads it from voice-assistant-piZero2W/.env next to the
+# script itself (see load_device_env()), independent of this unit's working
+# directory or environment. Edit that .env on the Pi to change gain/devices;
+# this file does not need touching for that.
 
 [Unit]
 Description=Voice Assistant audio endpoint (Raspberry Pi Zero 2 W)
@@ -27,33 +27,19 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/voice-assistant-piZero2W
 
-# Audio + transport configuration. These mirror config/targets.example.env in
-# voice-assistant-app and are the VERIFIED settings for this board.
+# The endpoint always dials its own loopback, never a Mac IP directly. The
+# Mac side opens `ssh -R 8765:localhost:8765` (scripts/lib/tunnel.sh) before
+# each session, which forwards this back to the app's real listening socket.
 #
-# The card is addressed by ID, never by numeric index: this Pi also has a
-# vc4hdmi card, so index numbers are not stable across boots.
-Environment=VOICE_ASSISTANT_TARGET=pizero2w
-Environment=VOICE_ASSISTANT_ALSA_CARD_ID=sndrpigooglevoi
-Environment=VOICE_ASSISTANT_CAPTURE_DEVICE=plughw:CARD=sndrpigooglevoi,DEV=0
-Environment=VOICE_ASSISTANT_PLAYBACK_DEVICE=plughw:CARD=sndrpigooglevoi,DEV=0
-Environment=VOICE_ASSISTANT_AUDIO_SAMPLE_RATE=48000
-Environment=VOICE_ASSISTANT_CAPTURE_FORMAT=S32_LE
-# The ICS-43434 is mono in the LEFT slot of a 2-channel I2S stream; the right
-# slot is silent by design. Capture 2, use the left one.
-Environment=VOICE_ASSISTANT_CAPTURE_CHANNELS=2
-Environment=VOICE_ASSISTANT_MIC_CHANNEL=left
-Environment=VOICE_ASSISTANT_PLAYBACK_CHANNELS=2
-# Steady multipliers. Do NOT normalize realtime chunks individually.
-Environment=VOICE_ASSISTANT_INPUT_GAIN=1.0
-Environment=VOICE_ASSISTANT_PLAYBACK_GAIN=0.35
-
-# Where the app (the Mac) is listening. The Pi dials out to it.
-# Override per-session with a drop-in or an EnvironmentFile:
-#   systemctl --user edit voice-assistant-pizero2w
-EnvironmentFile=-%h/.config/voice-assistant-pizero2w.env
-
-# PLACEHOLDER -- replace with the endpoint's real entrypoint.
-ExecStart=/usr/bin/false "Set ExecStart in ~/.config/systemd/user/voice-assistant-pizero2w.service"
+# Why: this Pi's normal network is an iPhone Personal Hotspot, which has been
+# observed running IPv6-only NAT64/464XLAT on this iPhone/Mac pairing --
+# `ipconfig getifaddr` on the Mac reports the 192.0.0.2 CLAT placeholder
+# instead of a routable IPv4, and mDNS does not resolve Mac -> Pi over it
+# either. The SSH tunnel sidesteps both problems since SSH itself connects
+# fine regardless of the hotspot's addressing mode. If a session is ever run
+# without the launcher's tunnel, this command will simply fail to connect
+# until one exists.
+ExecStart=%h/voice-assistant-piZero2W/.venv/bin/python %h/voice-assistant-piZero2W/zero2w_client.py ws://127.0.0.1:8765
 
 # Restart on unexpected failure, but do not hammer the Pi Zero: 5s between
 # tries, and give up after 5 failures in 5 minutes so a broken build cannot

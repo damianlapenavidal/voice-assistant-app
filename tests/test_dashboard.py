@@ -27,6 +27,41 @@ class TestDashboardEventLoop:
 
         await session.stop_conversation()
 
+    async def test_set_volume_sends_set_volume_message(self) -> None:
+        from voice_assistant.core.message import MessageType
+
+        transport = MockTransport()
+        session = SessionManager(transport)
+        await session.wait_for_device()
+
+        main_loop = asyncio.get_running_loop()
+        dashboard = DashboardManager(session, main_loop=main_loop)
+        dashboard.set_web_loop(main_loop)
+
+        result = await dashboard.handle_browser_command(
+            "set_volume", {"action": "set_volume", "value": 70},
+        )
+
+        assert result["status"] == "ok"
+        volume_msgs = [m for m in transport.sent_messages if m.type == MessageType.SET_VOLUME]
+        assert len(volume_msgs) == 1
+        assert volume_msgs[0].payload == {"volume": 70}
+
+    async def test_set_volume_rejects_invalid_value(self) -> None:
+        transport = MockTransport()
+        session = SessionManager(transport)
+        await session.wait_for_device()
+
+        main_loop = asyncio.get_running_loop()
+        dashboard = DashboardManager(session, main_loop=main_loop)
+        dashboard.set_web_loop(main_loop)
+
+        result = await dashboard.handle_browser_command(
+            "set_volume", {"action": "set_volume", "value": "not-a-number"},
+        )
+
+        assert result["status"] == "error"
+
     async def test_session_event_broadcast_schedules_on_same_loop(self) -> None:
         transport = MockTransport()
         session = SessionManager(transport)

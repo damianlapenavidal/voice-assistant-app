@@ -50,14 +50,20 @@ def load_prompt(name: str) -> str:
 
 
 def load_system_instructions(persona_id: str) -> str:
-    """Compose full system instructions from the base prompt plus a persona.
+    """Compose full system instructions from three layered prompt files.
 
-    Final instructions = ``base_system.md`` + a blank line + the persona file at
-    ``personas/{persona_id}.md``.
+    Final instructions = ``base_system.md`` (who the assistant is and how it
+    plays) + ``teaching_method.md`` (the shared language-teaching pedagogy and
+    core-vocabulary spine) + the persona file at ``personas/{persona_id}.md``
+    (the character and its themed content), each separated by a blank line.
+
+    Keeping the teaching method in its own layer means every persona teaches with
+    the same research-based approach without repeating it in each file.
     """
     base = _read("base_system")
+    method = _read("teaching_method")
     persona = _read(f"personas/{persona_id}")
-    return f"{base}\n\n{persona}"
+    return f"{base}\n\n{method}\n\n{persona}"
 
 
 def clear_cache() -> None:
