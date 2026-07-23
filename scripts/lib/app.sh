@@ -48,7 +48,7 @@ _port_in_use() {
 # exits 0.
 _established_count() {
   local port="$1" count
-  count="$(netstat -an 2>/dev/null | grep -c "\.${port} .*ESTABLISHED")" || true
+  count="$(netstat -an 2>/dev/null | grep -c "\.${port} .*ESTABLISHED" || true)"
   count="${count//[^0-9]/}"
   printf '%s' "${count:-0}"
 }
