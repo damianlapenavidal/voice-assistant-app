@@ -1,0 +1,70 @@
+# Raspberry Pi Zero 2 W audio endpoint -- USER service.
+#
+# INSTALL ON: the Pi Zero 2 W (not the Mac).
+#     mkdir -p ~/.config/systemd/user
+#     cp deploy/systemd/voice-assistant-pizero2w.service ~/.config/systemd/user/
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now voice-assistant-pizero2w
+#     loginctl enable-linger "$(id -un)"     # survive SSH logout + start at boot
+#
+# A *user* service is used deliberately: it needs no sudo, so deploying never
+# requires a passwordless-sudo grant. The endpoint only needs the `audio` group
+# (already granted) to reach /dev/snd -- it does not need root.
+#
+# Audio device config (AUDIO_INPUT_DEVICE, INPUT_GAIN, etc.) is NOT set here --
+# zero2w_client.py loads it from voice-assistant-piZero2W/.env next to the
+# script itself (see load_device_env()), independent of this unit's working
+# directory or environment. Edit that .env on the Pi to change gain/devices;
+# this file does not need touching for that.
+
+[Unit]
+Description=Voice Assistant audio endpoint (Raspberry Pi Zero 2 W)
+Documentation=https://github.com/damianlapenavidal/voice-assistant-piZero2W
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/voice-assistant-piZero2W
+
+# The endpoint always dials its own loopback, never a Mac IP directly. The
+# Mac side opens `ssh -R 8765:localhost:8765` (scripts/lib/tunnel.sh) before
+# each session, which forwards this back to the app's real listening socket.
+#
+# Why: this Pi's normal network is an iPhone Personal Hotspot, which has been
+# observed running IPv6-only NAT64/464XLAT on this iPhone/Mac pairing --
+# `ipconfig getifaddr` on the Mac reports the 192.0.0.2 CLAT placeholder
+# instead of a routable IPv4, and mDNS does not resolve Mac -> Pi over it
+# either. The SSH tunnel sidesteps both problems since SSH itself connects
+# fine regardless of the hotspot's addressing mode. If a session is ever run
+# without the launcher's tunnel, this command will simply fail to connect
+# until one exists.
+ExecStart=%h/voice-assistant-piZero2W/.venv/bin/python %h/voice-assistant-piZero2W/zero2w_client.py ws://127.0.0.1:8765
+
+# Restart on unexpected failure, but do not hammer the Pi Zero: 5s between
+# tries, and give up after 5 failures in 5 minutes so a broken build cannot
+# spin the CPU (and drain a battery) indefinitely.
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Keep the Zero 2 W light: it is a 512 MB, 4-core board intended to run on
+# battery. Nice the process slightly below interactive work, and cap memory so
+# a leak fails loudly instead of swapping the board to death.
+Nice=-5
+MemoryMax=256M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=va-pizero2w
+
+# Modest hardening. The endpoint needs /dev/snd and the network, nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/voice-assistant-piZero2W
+
+[Install]
+WantedBy=default.target

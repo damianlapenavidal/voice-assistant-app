@@ -53,7 +53,7 @@ Sent by the device immediately after connecting. Announces the device and its ca
 | Field | Type | Description |
 |-------|------|-------------|
 | `device_id` | string | Unique identifier for the device |
-| `device_type` | string | `"pi5"` or `"piZero2W"` |
+| `device_type` | string | `"pi5"` or `"pi_zero_2w"` |
 | `firmware_version` | string | Firmware/software version on the device |
 | `capabilities` | string[] | List of supported features (e.g., `["audio_capture", "audio_playback"]`) |
 
@@ -378,6 +378,37 @@ Adjusts the device's speaker volume.
   "type": "SET_VOLUME",
   "payload": {
     "volume": 75
+  },
+  "timestamp": "2026-06-30T15:00:02.000Z"
+}
+```
+
+---
+
+#### `SET_MIC_GAIN`
+
+Adjusts the device's microphone input gain.
+
+**Payload:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `gain` | integer | Gain level from 0 to 100 |
+
+`gain` is a percentage of the device's configured `MAX_INPUT_GAIN`, not a
+direct multiplier — a device with `MAX_INPUT_GAIN=50.0` maps `gain: 100` to an
+actual capture-stage multiplier of 50.0x. This lets each board expose its own
+verified headroom (raw mic signal level varies by hardware) behind the same
+0-100 dashboard control. Applied live to the next captured chunk; capture does
+not restart.
+
+**Example:**
+
+```json
+{
+  "type": "SET_MIC_GAIN",
+  "payload": {
+    "gain": 40
   },
   "timestamp": "2026-06-30T15:00:02.000Z"
 }

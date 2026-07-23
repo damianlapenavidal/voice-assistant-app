@@ -63,6 +63,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Web dashboard port (default: from config or 8080)",
     )
     parser.add_argument(
+        "--target",
+        type=str,
+        default=None,
+        help=(
+            "Raspberry Pi target this session is for (default: from "
+            "VOICE_ASSISTANT_TARGET). Rejects a handshake from a different board."
+        ),
+    )
+    parser.add_argument(
         "--loopback",
         action="store_true",
         help="Force loopback mode even when an OpenAI API key is configured",
@@ -236,6 +245,7 @@ async def _main_async(
     log.info(
         "app.starting",
         mode="mock" if config.mock_mode else "device",
+        target=config.target or None,
         host=config.device_host,
         port=config.device_port,
         web=config.web_enabled,
@@ -297,6 +307,8 @@ def main(argv: list[str] | None = None) -> None:
         config.web_enabled = True
     if args.web_port is not None:
         config.web_port = args.web_port
+    if args.target is not None:
+        config.target = args.target
     if args.log_level:
         config.log_level = args.log_level
 

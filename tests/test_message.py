@@ -12,6 +12,7 @@ from voice_assistant.core.message import (
     HelloPayload,
     Message,
     MessageType,
+    SetMicGainPayload,
     SetVolumePayload,
     create_message,
     parse_message,
@@ -45,7 +46,7 @@ class TestMessageTypeEnum:
         assert MessageType[name].value == name
 
     def test_total_message_types(self) -> None:
-        assert len(MessageType) == 17
+        assert len(MessageType) == 18
 
 
 class TestCreateMessage:
@@ -170,6 +171,26 @@ class TestPayloadValidation:
     def test_set_volume_negative_raises(self) -> None:
         with pytest.raises(ValidationError):
             SetVolumePayload(volume=-1)
+
+    def test_set_mic_gain_valid(self) -> None:
+        smg = SetMicGainPayload(gain=50)
+        assert smg.gain == 50
+
+    def test_set_mic_gain_min(self) -> None:
+        smg = SetMicGainPayload(gain=0)
+        assert smg.gain == 0
+
+    def test_set_mic_gain_max(self) -> None:
+        smg = SetMicGainPayload(gain=100)
+        assert smg.gain == 100
+
+    def test_set_mic_gain_too_high_raises(self) -> None:
+        with pytest.raises(ValidationError):
+            SetMicGainPayload(gain=101)
+
+    def test_set_mic_gain_negative_raises(self) -> None:
+        with pytest.raises(ValidationError):
+            SetMicGainPayload(gain=-1)
 
     def test_hello_payload_requires_fields(self) -> None:
         with pytest.raises(ValidationError):

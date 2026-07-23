@@ -1,0 +1,45 @@
+# Raspberry Pi 5 audio endpoint -- USER service template.
+#
+# INSTALL ON: the Pi 5 (not the Mac).
+#     mkdir -p ~/.config/systemd/user
+#     cp deploy/systemd/voice-assistant-pi5.service ~/.config/systemd/user/
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now voice-assistant-pi5
+#     loginctl enable-linger "$(id -un)"
+#
+# The endpoint dials ws://127.0.0.1:8765 (its own loopback). Pair with
+# PI5_USE_SSH_TUNNEL="1" in config/targets.local.env so the Mac launcher opens
+# `ssh -R 8765:localhost:8765` before starting the app.
+#
+# ALSA device settings still live in the endpoint's own .env / EnvironmentFile;
+# fill PI5_* ALSA keys in targets.local.env once verified on this board.
+
+[Unit]
+Description=Voice Assistant audio endpoint (Raspberry Pi 5)
+Documentation=https://github.com/damianlapenavidal/voice-assistant-pi5
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/voice-assistant-pi5/device
+ExecStart=%h/voice-assistant-pi5/.venv/bin/python %h/voice-assistant-pi5/device/pi5_client.py ws://127.0.0.1:8765
+
+# always: pi5_client exits 0 after a few refused connects while the Mac app is
+# not listening yet; on-failure would leave the unit dead in that window.
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=va-pi5
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/voice-assistant-pi5
+
+[Install]
+WantedBy=default.target

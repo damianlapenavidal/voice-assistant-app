@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from voice_assistant.audio.bridge import AudioBridge
-from voice_assistant.audio.utils import pcm16_to_base64
+from voice_assistant.audio.bridge import AudioBridge, TAIL_SILENCE
+from voice_assistant.audio.utils import base64_to_pcm16, pcm16_to_base64
 from voice_assistant.core.message import MessageType
 from voice_assistant.core.session import SessionManager, SessionState
 from voice_assistant.openai_client.realtime import (
@@ -82,6 +82,31 @@ class TestLoopbackRelay:
         sent_msg = transport.send_message.call_args[0][0]
         assert sent_msg.payload["audio"] == audio
         assert sent_msg.payload["sequence_number"] == 42
+
+    async def test_calibration_complete_sends_unmute_so_device_starts_streaming(
+        self,
+    ) -> None:
+        """The device (pi5_client.py/zero2w_client.py) only flips its
+        `_stream_to_laptop` gate on `skip_calibration` resume or on receiving
+        UNMUTE_MIC. Loopback has no opening-greeting mute/unmute cycle, so
+        without an explicit UNMUTE_MIC here the device stays silent forever
+        after a fresh (non-resumed) calibration.
+        """
+        transport = _make_mock_transport()
+        bridge = AudioBridge(transport, loopback=True)
+        bridge.set_device_ready(True)
+        bridge.start()
+
+        await bridge.handle_calibration_complete({
+            "noise_floor": 350.0,
+            "user_speech_peak": 850.0,
+        })
+
+        unmute_calls = [
+            c for c in transport.send_message.call_args_list
+            if c[0][0].type == MessageType.UNMUTE_MIC
+        ]
+        assert len(unmute_calls) == 1
 
     async def test_multiple_frames_increment_count(self) -> None:
         transport = _make_mock_transport()
@@ -411,12 +436,16 @@ class TestWholeChunkPlayback:
             c for c in transport.send_message.call_args_list
             if c[0][0].type == MessageType.PLAY_AUDIO
         ]
-        assert len(play_calls) == 1, f"Expected 1 PLAY_AUDIO, got {len(play_calls)}"
 
-        payload = play_calls[0][0][0].payload
-        assert payload["is_final"] is True
-        assert payload["audio"] == pcm16_to_base64(pcm1 + pcm2)
-        assert payload["duration_ms"] > 0
+        # Audio is delivered as the reply followed by a trailing silence pad,
+        # split across whole 4800-byte chunks with is_final on the last only.
+        delivered = b"".join(
+            base64_to_pcm16(c[0][0].payload["audio"]) for c in play_calls
+        )
+        assert delivered == pcm1 + pcm2 + TAIL_SILENCE
+        assert play_calls[-1][0][0].payload["is_final"] is True
+        assert all(c[0][0].payload["is_final"] is False for c in play_calls[:-1])
+        assert play_calls[0][0][0].payload["duration_ms"] > 0
 
         unmute_calls = [
             c for c in transport.send_message.call_args_list
@@ -500,10 +529,17 @@ class TestPlayAudioChunking:
             c for c in transport.send_message.call_args_list
             if c[0][0].type == MessageType.PLAY_AUDIO
         ]
-        expected_chunks = (pcm_size + PLAY_AUDIO_CHUNK_BYTES - 1) // PLAY_AUDIO_CHUNK_BYTES
-        if pcm_size % PLAY_AUDIO_CHUNK_BYTES == 0:
+        # Delivered audio includes the trailing silence pad appended at finalize.
+        total = pcm_size + len(TAIL_SILENCE)
+        expected_chunks = (total + PLAY_AUDIO_CHUNK_BYTES - 1) // PLAY_AUDIO_CHUNK_BYTES
+        if total % PLAY_AUDIO_CHUNK_BYTES == 0:
             expected_chunks += 1  # empty is_final=True marker after exact full chunks
         assert len(play_calls) == expected_chunks
+
+        delivered = b"".join(
+            base64_to_pcm16(c[0][0].payload["audio"]) for c in play_calls
+        )
+        assert delivered == pcm + TAIL_SILENCE
 
         for call in play_calls:
             msg: Message = call[0][0]
@@ -663,6 +699,67 @@ class TestAudioBridgeTranscriptOrdering:
         await bridge._event_task
 
         assert transcripts == [("assistant", "Welcome!", True)]
+
+    async def test_held_assistant_released_when_user_turn_is_echo(self) -> None:
+        # If the only user transcript for the turn is filtered as echo, the
+        # buffered assistant reply must still be emitted (not orphaned).
+        bridge = AudioBridge(_make_mock_transport(), loopback=False)
+        transcripts: list[tuple[str, str, bool]] = []
+        bridge.set_transcript_callback(lambda r, t, f: transcripts.append((r, t, f)))
+
+        event_queue: asyncio.Queue = asyncio.Queue()
+        await event_queue.put(RealtimeSpeechStopped())
+        await event_queue.put(
+            RealtimeTranscript(role="assistant", text="Hello there friend", final=True),
+        )
+        # User transcript is an echo of the assistant line → filtered out.
+        await event_queue.put(
+            RealtimeTranscript(role="user", text="Hello there friend", final=True),
+        )
+
+        mock_client = AsyncMock()
+        mock_client.is_connected = True
+
+        async def fake_iter():
+            while True:
+                event = await event_queue.get()
+                if event is None:
+                    return
+                yield event
+
+        mock_client.iter_events = fake_iter
+        bridge._realtime_client = mock_client
+        bridge.start()
+        bridge._event_task = asyncio.create_task(bridge._process_realtime_events())
+
+        await asyncio.sleep(0.1)
+        await event_queue.put(None)
+        await bridge._event_task
+
+        assert ("assistant", "Hello there friend", True) in transcripts
+        assert all(role != "user" for role, _, _ in transcripts)
+
+    async def test_held_assistant_flushed_on_user_transcript_timeout(
+        self, monkeypatch
+    ) -> None:
+        # If the user transcript never lands, the held assistant reply is still
+        # released after the timeout rather than being dropped.
+        import voice_assistant.audio.bridge as bridge_mod
+
+        monkeypatch.setattr(bridge_mod, "USER_TRANSCRIPT_TIMEOUT_SEC", 0.05)
+
+        bridge = AudioBridge(_make_mock_transport(), loopback=False)
+        transcripts: list[tuple[str, str, bool]] = []
+        bridge.set_transcript_callback(lambda r, t, f: transcripts.append((r, t, f)))
+
+        bridge._awaiting_user_transcript = True
+        bridge._buffered_transcripts.append(("assistant", "Reply", True))
+        bridge._schedule_user_transcript_timeout()
+
+        await asyncio.sleep(0.15)
+
+        assert transcripts == [("assistant", "Reply", True)]
+        assert bridge._awaiting_user_transcript is False
 
 
 class TestCalibrationHelloStartup:

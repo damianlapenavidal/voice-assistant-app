@@ -15,7 +15,7 @@ import structlog
 import websockets
 from websockets.asyncio.client import ClientConnection
 
-from voice_assistant.config import Config, DEFAULT_OPENING_GREETING_INSTRUCTIONS
+from voice_assistant.config import Config
 from voice_assistant.audio.utils import SAMPLE_RATE, base64_to_pcm16, pcm16_to_base64
 from voice_assistant.audio.vad import VadSettings, derive_vad_settings
 
@@ -129,6 +129,7 @@ class RealtimeClient:
         self._instructions = (
             instructions if instructions is not None else cfg.assistant_instructions
         )
+        self._opening_greeting_instructions = cfg.opening_greeting_instructions
         self._apply_vad_settings(
             vad_settings
             or derive_vad_settings(noise_floor=400.0, user_speech_peak=650.0)
@@ -144,6 +145,7 @@ class RealtimeClient:
         self._session_updated_event = asyncio.Event()
 
     def _apply_vad_settings(self, settings: VadSettings) -> None:
+        self._vad_eagerness = settings.eagerness
         self._vad_threshold = settings.threshold
         self._vad_silence_ms = settings.silence_ms
         self._vad_prefix_padding_ms = settings.prefix_padding_ms
@@ -151,6 +153,7 @@ class RealtimeClient:
     @property
     def vad_settings(self) -> VadSettings:
         return VadSettings(
+            eagerness=self._vad_eagerness,
             threshold=self._vad_threshold,
             silence_ms=self._vad_silence_ms,
             prefix_padding_ms=self._vad_prefix_padding_ms,
@@ -268,7 +271,9 @@ class RealtimeClient:
             raise RealtimeNotConnectedError("Realtime client is not connected")
 
         greeting_instructions = (
-            instructions if instructions is not None else DEFAULT_OPENING_GREETING_INSTRUCTIONS
+            instructions
+            if instructions is not None
+            else self._opening_greeting_instructions
         )
         event = {
             "type": "response.create",
@@ -293,12 +298,10 @@ class RealtimeClient:
             raise RealtimeNotConnectedError("Realtime client is not connected")
 
         turn_cfg: dict[str, Any] = {
-            "type": "server_vad",
+            "type": "semantic_vad",
+            "eagerness": self._vad_eagerness,
             "create_response": True,
             "interrupt_response": True,
-            "threshold": self._vad_threshold,
-            "prefix_padding_ms": self._vad_prefix_padding_ms,
-            "silence_duration_ms": self._vad_silence_ms,
         }
 
         event = {
@@ -326,8 +329,8 @@ class RealtimeClient:
             "realtime.session_update_sent",
             model=self._model,
             voice=self._voice,
-            vad_threshold=self._vad_threshold,
-            silence_ms=self._vad_silence_ms,
+            vad_type="semantic_vad",
+            vad_eagerness=self._vad_eagerness,
         )
 
     async def _receive_loop(self) -> None:

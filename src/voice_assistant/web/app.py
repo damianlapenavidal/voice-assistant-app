@@ -62,12 +62,17 @@ class DashboardManager:
         elif event == "mic_muted":
             self._mic_muted = data.get("muted", False)
         elif event == "transcript":
-            self._transcripts.append({
-                "role": data.get("role", ""),
-                "text": data.get("text", ""),
-                "final": data.get("final", False),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
+            # Persist only completed lines in the bounded history. Streaming
+            # partials are still broadcast live to connected browsers below, but
+            # keeping them here would let a single long reply's many deltas evict
+            # earlier final lines from the deque.
+            if data.get("final"):
+                self._transcripts.append({
+                    "role": data.get("role", ""),
+                    "text": data.get("text", ""),
+                    "final": True,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
 
         entry = {
             "event": event,
@@ -134,15 +139,23 @@ class DashboardManager:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    async def handle_browser_command(self, action: str) -> dict[str, str]:
+    async def handle_browser_command(
+        self,
+        action: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
         """Execute a command from the browser dashboard (web thread -> main loop)."""
         future = asyncio.run_coroutine_threadsafe(
-            self._handle_browser_command_main(action),
+            self._handle_browser_command_main(action, payload or {}),
             self._main_loop,
         )
         return await asyncio.wrap_future(future)
 
-    async def _handle_browser_command_main(self, action: str) -> dict[str, str]:
+    async def _handle_browser_command_main(
+        self,
+        action: str,
+        payload: dict[str, Any],
+    ) -> dict[str, str]:
         """Run dashboard commands on the main session event loop."""
         sm = self._session_manager
         try:
@@ -175,6 +188,30 @@ class DashboardManager:
                 case "shutdown":
                     await sm.shutdown_device()
                     return {"status": "ok", "message": "Device shutdown sent"}
+                case "set_volume":
+                    if not sm.handshake_complete:
+                        return {
+                            "status": "error",
+                            "message": "Waiting for device handshake (HELLO_ACK)",
+                        }
+                    try:
+                        volume = int(payload.get("value"))
+                    except (TypeError, ValueError):
+                        return {"status": "error", "message": "Invalid volume value"}
+                    await sm.set_volume(volume)
+                    return {"status": "ok", "message": f"Volume set to {volume}%"}
+                case "set_mic_gain":
+                    if not sm.handshake_complete:
+                        return {
+                            "status": "error",
+                            "message": "Waiting for device handshake (HELLO_ACK)",
+                        }
+                    try:
+                        gain = int(payload.get("value"))
+                    except (TypeError, ValueError):
+                        return {"status": "error", "message": "Invalid mic gain value"}
+                    await sm.set_mic_gain(gain)
+                    return {"status": "ok", "message": f"Mic gain set to {gain}%"}
                 case "turn_on":
                     if sm.state == SessionState.SHUTDOWN:
                         await sm.turn_on()
@@ -214,7 +251,7 @@ def create_app(dashboard: DashboardManager) -> "FastAPI":
                 try:
                     cmd = json.loads(raw)
                     action = cmd.get("action", "")
-                    result = await dashboard.handle_browser_command(action)
+                    result = await dashboard.handle_browser_command(action, cmd)
                     await ws.send_text(json.dumps({
                         "event": "command_result",
                         "data": result,

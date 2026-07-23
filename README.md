@@ -51,15 +51,67 @@ cp .env.example .env
 python -m voice_assistant --mock
 ```
 
+## Running against a Raspberry Pi
+
+One command per target, from the repo root on the Mac:
+
+```bash
+./scripts/setup-target-config.sh    # one time: creates config/targets.local.env
+
+./scripts/start-pi5.sh              # Raspberry Pi 5
+./scripts/start-pizero2w.sh         # Raspberry Pi Zero 2 W
+
+./scripts/terminate-pi5.sh          # stop Pi service + Mac app + tunnels
+./scripts/terminate-pizero2w.sh
+```
+
+Each launcher checks SSH before touching Wi-Fi, switches the Mac to the target's
+saved network only when needed, updates the Pi with `git pull --ff-only` (never
+destructively), runs a silent ALSA preflight, restarts the endpoint service, waits
+for it to be ready, and then starts this app with that target selected.
+
+`Ctrl+C` in the start terminal stops the Mac app (and tunnel) but leaves the Pi
+service running. Use `terminate-*` to tear down the full session.
+
+```bash
+./scripts/start-pizero2w.sh --dry-run   # show every step, change nothing
+./scripts/start-pizero2w.sh --logs      # follow the endpoint journal
+```
+
+Audio hardware can be checked separately. `--info` and `--mic` are silent;
+`--speaker` and `--loopback` make sound and ask first:
+
+```bash
+./scripts/audio-diagnostic.sh pizero2w --info
+./scripts/audio-diagnostic.sh pizero2w --mic
+```
+
+See **[docs/raspberry-pi-development-workflow.md](docs/raspberry-pi-development-workflow.md)**
+for setup, the verified Pi Zero 2 W audio configuration, and troubleshooting.
+
 ## Project Status
 
-**Phase 0 -- Planning and Setup**
-
-The project is in its initial setup phase. The folder structure, dependencies, and architecture documentation are being established. See the [phased roadmap](docs/roadmap.md) for the full development plan.
+Working Mac + Raspberry Pi voice assistant with OpenAI Realtime, bilingual
+persona prompts, parent web dashboard, and Mac-side deploy/terminate scripts
+for the Pi 5 and Pi Zero 2 W.
 
 ## Folder Structure
 
 ```
+scripts/                     # Mac-side launch + deploy workflow
+  start-pi5.sh               # wrapper -> start-target.sh pi5
+  start-pizero2w.sh          # wrapper -> start-target.sh pizero2w
+  start-target.sh            # the shared launch implementation
+  terminate-pi5.sh           # wrapper -> stop-target.sh pi5
+  terminate-pizero2w.sh      # wrapper -> stop-target.sh pizero2w
+  stop-target.sh             # stop Pi service, Mac app, orphan tunnels
+  setup-target-config.sh     # creates config/targets.local.env, lists SSIDs
+  audio-diagnostic.sh        # explicit, opt-in mic/speaker tests
+  lib/                       # common, config, network, ssh, deploy, audio,
+                             #   service, app, tunnel
+config/
+  targets.example.env        # committed, secret-free target template
+deploy/systemd/              # endpoint service templates (installed on a Pi)
 src/voice_assistant/
   main.py                    # CLI entrypoint
   config.py                  # Configuration loading (.env, defaults)
@@ -75,13 +127,14 @@ src/voice_assistant/
   audio/
     utils.py                 # Audio format helpers (PCM, base64, resampling)
 tests/                       # Unit and integration tests
-docs/                        # Architecture docs, protocol spec, roadmap
+docs/                        # Architecture, protocol, Pi workflow, learning design
 ```
 
 ## Documentation
 
 See the [docs/](docs/) directory for detailed documentation:
 
-- Architecture design and diagrams
-- Device-app protocol specification
-- Phased development roadmap
+- [Architecture](docs/architecture.md) — system layers and design
+- [Protocol](docs/protocol.md) — device ↔ app message contract
+- [Raspberry Pi workflow](docs/raspberry-pi-development-workflow.md) — launch, deploy, audio
+- [Learning design](docs/learning-design.md) — bilingual teaching pedagogy and prompts

@@ -10,7 +10,8 @@ from uuid import uuid4
 
 import structlog
 
-from voice_assistant.config import Config
+from voice_assistant.audio.utils import base64_to_pcm16, compute_audio_level
+from voice_assistant.config import Config, expected_device_type
 from voice_assistant.core.message import (
     Message,
     MessageType,
@@ -133,7 +134,30 @@ class SessionManager:
 
         await self._complete_handshake(hello)
 
+    def _verify_target(self, hello: Message) -> None:
+        """Reject a HELLO from a board other than the one the launcher selected.
+
+        Without this, launching `start-pizero2w.sh` while the Pi 5 happens to be
+        the thing that connects would run a full session against the wrong
+        hardware and only show up as confusing audio behaviour.
+        """
+        expected = expected_device_type(self._config.target)
+        if expected is None:
+            return
+
+        actual = (hello.payload or {}).get("device_type")
+        if actual == expected:
+            return
+
+        raise TransportError(
+            f"Target mismatch: launcher selected target "
+            f"'{self._config.target}' (expects device_type '{expected}') but the "
+            f"device announced device_type '{actual}'. Launch the matching "
+            f"target, or check which Pi is connected to this app."
+        )
+
     async def _complete_handshake(self, hello: Message) -> None:
+        self._verify_target(hello)
         self._session_id = str(uuid4())
         ack = create_message(
             MessageType.HELLO_ACK,
@@ -156,11 +180,14 @@ class SessionManager:
             "session.device_ready",
             session_id=self._session_id,
             device_id=device_id,
+            target=self._config.target or None,
+            device_type=(hello.payload or {}).get("device_type"),
         )
         self._emit("session_started", {
             "session_id": self._session_id,
             "device_id": device_id,
             "device_info": hello.payload,
+            "target": self._config.target,
         })
 
     async def start_conversation(self) -> None:
@@ -315,6 +342,28 @@ class SessionManager:
         log.info("session.shutdown", session_id=self._session_id)
         self._emit("session_shutdown", {"session_id": self._session_id})
 
+    async def set_volume(self, volume: int) -> None:
+        """Send SET_VOLUME (0-100) to the device -- speaker gain, live."""
+        if not self._handshake_complete:
+            raise TransportError("Cannot set volume before HELLO_ACK")
+
+        volume = max(0, min(100, int(volume)))
+        msg = create_message(MessageType.SET_VOLUME, {"volume": volume})
+        await self._transport.send_message(msg)
+        log.info("session.volume_set", volume=volume, session_id=self._session_id)
+        self._emit("volume_set", {"volume": volume})
+
+    async def set_mic_gain(self, gain: int) -> None:
+        """Send SET_MIC_GAIN (0-100) to the device -- microphone gain, live."""
+        if not self._handshake_complete:
+            raise TransportError("Cannot set mic gain before HELLO_ACK")
+
+        gain = max(0, min(100, int(gain)))
+        msg = create_message(MessageType.SET_MIC_GAIN, {"gain": gain})
+        await self._transport.send_message(msg)
+        log.info("session.mic_gain_set", gain=gain, session_id=self._session_id)
+        self._emit("mic_gain_set", {"gain": gain})
+
     async def turn_on(self) -> None:
         """Re-arm the app after a shutdown so a device can reconnect.
 
@@ -417,6 +466,13 @@ class SessionManager:
                 if self._audio_bridge is not None:
                     await self._audio_bridge.handle_audio_frame(payload)
                 self._emit("audio_frame", payload)
+                audio_b64 = payload.get("audio", "")
+                if audio_b64:
+                    level, clipping = compute_audio_level(base64_to_pcm16(audio_b64))
+                    self._emit("audio_level", {
+                        "level": round(level, 3),
+                        "clipping": clipping,
+                    })
                 log.debug(
                     "session.audio_frame",
                     seq=payload.get("sequence_number"),

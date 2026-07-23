@@ -13,8 +13,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from voice_assistant.audio.bridge import AudioBridge
-from voice_assistant.audio.utils import generate_test_tone, pcm16_to_base64
+from voice_assistant.audio.bridge import AudioBridge, TAIL_SILENCE
+from voice_assistant.audio.utils import (
+    base64_to_pcm16,
+    generate_test_tone,
+    pcm16_to_base64,
+)
 from voice_assistant.config import Config
 from voice_assistant.core.message import MessageType
 from voice_assistant.core.session import SessionManager, SessionState
@@ -108,10 +112,14 @@ class TestAudioBridgeOpenAIMode:
         mute_calls = [c for c in calls if c[0][0].type == MessageType.MUTE_MIC]
         play_calls = [c for c in calls if c[0][0].type == MessageType.PLAY_AUDIO]
         assert len(mute_calls) == 1, f"Expected 1 MUTE_MIC, got {len(mute_calls)}"
-        assert len(play_calls) == 1, f"Expected 1 PLAY_AUDIO, got {len(play_calls)}"
-        sent_msg = play_calls[0][0][0]
-        assert sent_msg.payload["audio"] == pcm16_to_base64(pcm_response)
-        assert sent_msg.payload["is_final"] is True
+        # The reply plus a trailing silence pad is delivered across whole chunks,
+        # with is_final on the last chunk only.
+        delivered = b"".join(
+            base64_to_pcm16(c[0][0].payload["audio"]) for c in play_calls
+        )
+        assert delivered == pcm_response + TAIL_SILENCE
+        assert play_calls[-1][0][0].payload["is_final"] is True
+        assert all(c[0][0].payload["is_final"] is False for c in play_calls[:-1])
 
         unmute_calls = [c for c in calls if c[0][0].type == MessageType.UNMUTE_MIC]
         assert len(unmute_calls) == 0

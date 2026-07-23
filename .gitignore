@@ -13,6 +13,10 @@ venv/
 # Environment variables
 .env
 
+# Machine-specific Raspberry Pi target configuration (SSIDs, hosts, gains).
+# config/targets.example.env is the committed, secret-free template.
+config/targets.local.env
+
 # Testing / type checking
 .pytest_cache/
 .mypy_cache/
@@ -20,6 +24,7 @@ venv/
 # IDEs
 .idea/
 .vscode/
+.claude/
 
 # OS
 *.DS_Store

@@ -9,7 +9,8 @@ from collections.abc import AsyncIterator
 import pytest
 
 from voice_assistant.audio.utils import generate_test_tone, pcm16_to_base64
-from voice_assistant.config import Config, DEFAULT_ASSISTANT_INSTRUCTIONS, DEFAULT_OPENAI_MODEL
+from voice_assistant.config import Config, DEFAULT_OPENAI_MODEL
+from voice_assistant.prompts import load_prompt, load_system_instructions
 from voice_assistant.openai_client.realtime import (
     RealtimeAudioDelta,
     RealtimeClient,
@@ -107,15 +108,13 @@ class TestRealtimeClientConnect:
         assert session_update["type"] == "session.update"
         session = session_update["session"]
         assert session["model"] == DEFAULT_OPENAI_MODEL
-        assert session["instructions"] == DEFAULT_ASSISTANT_INSTRUCTIONS
+        assert session["instructions"] == load_system_instructions("oso_animals")
         assert session["audio"]["input"]["format"]["rate"] == 24000
-        assert session["audio"]["input"]["turn_detection"]["type"] == "server_vad"
+        assert session["audio"]["input"]["turn_detection"]["type"] == "semantic_vad"
         vad = session["audio"]["input"]["turn_detection"]
         assert vad["create_response"] is True
         assert vad["interrupt_response"] is True
-        assert 0.35 <= vad["threshold"] <= 0.85
-        assert vad["silence_duration_ms"] >= 650
-        assert vad["prefix_padding_ms"] == 300
+        assert vad["eagerness"] in {"low", "medium", "high", "auto"}
         assert session["audio"]["output"]["voice"] == "alloy"
 
         await client.disconnect()
@@ -218,8 +217,6 @@ class TestRealtimeClientOpeningGreeting:
         mock_ws: MockWebSocket,
         incoming_queue: asyncio.Queue[str | None],
     ) -> None:
-        from voice_assistant.config import DEFAULT_OPENING_GREETING_INSTRUCTIONS
-
         client = await _connect_client(mock_ws, incoming_queue)
         await client.request_opening_greeting()
 
@@ -228,7 +225,7 @@ class TestRealtimeClientOpeningGreeting:
         response = greeting_event["response"]
         assert response["output_modalities"] == ["audio"]
         assert "modalities" not in response
-        assert response["instructions"] == DEFAULT_OPENING_GREETING_INSTRUCTIONS
+        assert response["instructions"] == load_prompt("opening_greeting")
         await client.disconnect()
 
 
@@ -282,7 +279,7 @@ class TestRealtimeClientEvents:
         ]
         assert len(session_updates) == 2
         latest = session_updates[-1]["session"]["audio"]["input"]["turn_detection"]
-        assert latest["threshold"] == settings.threshold
+        assert latest["eagerness"] == settings.eagerness
         await client.disconnect()
 
     async def test_output_audio_delta(
