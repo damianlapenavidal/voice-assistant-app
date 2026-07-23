@@ -237,7 +237,7 @@ inspection so it can tell you what *would* fail.
 
 ## 4. How Git-pull deployment works
 
-Deployment is **non-destructive by contract.**
+Deployment refuses to discard *tracked* local work on the Pi.
 
 **[Mac]** the launcher runs, over SSH on the Pi:
 
@@ -245,13 +245,20 @@ Deployment is **non-destructive by contract.**
 git fetch --prune origin
 git checkout <branch>
 git pull --ff-only origin <branch>
+# then prune ignored rename/delete leftovers (never .env / .venv)
 ```
 
-It **never** runs `git reset --hard`, `git clean -fd`, a forced checkout, or a
-forced pull. Before pulling it checks `git status --porcelain`; if the remote
-worktree has *any* uncommitted or untracked change, deployment **aborts** and
-lists the files. Work done directly on a Pi is easy to lose and hard to
-reproduce, so the launcher will never discard it for you.
+It **never** runs `git reset --hard`, a forced checkout, or a forced pull.
+Before pulling it checks `git status --porcelain`; if the remote worktree has
+*any* uncommitted or untracked (non-ignored) change, deployment **aborts** and
+lists the files.
+
+`git pull` alone can leave the Pi looking wrong after renames: ignored debris
+like `src/__pycache__` or an obsolete `device/` directory stays on disk even
+when `HEAD` matches GitHub. After a successful fast-forward the launcher
+therefore removes those leftover top-level paths (and `__pycache__` dirs) and
+verifies the tree matches `origin/<branch>`. Protected paths — `.env`, `.venv`,
+`venv`, and `.git` — are never deleted.
 
 Resolve a dirty worktree yourself, **[Pi]**:
 
