@@ -12,7 +12,10 @@
 # `ssh -R 8765:localhost:8765` before starting the app.
 #
 # ALSA device settings still live in the endpoint's own .env / EnvironmentFile;
-# fill PI5_* ALSA keys in targets.local.env once verified on this board.
+# fill PI5_* ALSA keys in targets.local.env once verified on that board.
+#
+# Repo layout (after the 2026-07 flatten): pi5_client.py lives at the repo root,
+# not under device/.
 
 [Unit]
 Description=Voice Assistant audio endpoint (Raspberry Pi 5)
@@ -22,8 +25,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/voice-assistant-pi5/device
-ExecStart=%h/voice-assistant-pi5/.venv/bin/python %h/voice-assistant-pi5/device/pi5_client.py ws://127.0.0.1:8765
+WorkingDirectory=%h/voice-assistant-pi5
+ExecStart=%h/voice-assistant-pi5/.venv/bin/python %h/voice-assistant-pi5/pi5_client.py ws://127.0.0.1:8765
 
 # always: pi5_client exits 0 after a few refused connects while the Mac app is
 # not listening yet; on-failure would leave the unit dead in that window.
