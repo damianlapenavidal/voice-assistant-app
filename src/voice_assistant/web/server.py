@@ -41,10 +41,29 @@ def start_web_server_thread(
         server = uvicorn.Server(config)
 
         async def _serve() -> None:
-            await server.serve()
+            # Signal readiness only once uvicorn has actually started: the
+            # socket is bound AND app startup has completed, so the very first
+            # request a caller makes after `ready` will be served. Setting the
+            # event before serve() (as this used to) let callers -- and the
+            # "web.dashboard_started" log -- race ahead of a server that could
+            # not yet answer HTTP, so the dashboard "wasn't loading yet".
+            async def _signal_ready_when_started() -> None:
+                try:
+                    while not server.started:
+                        await asyncio.sleep(0.02)
+                finally:
+                    # Set even if serve() aborts, so callers fall through to
+                    # their timeout instead of blocking the full 120s.
+                    ready.set()
 
-        ready.set()
-        log.info("web.dashboard_starting", port=port)
+            ready_task = asyncio.ensure_future(_signal_ready_when_started())
+            log.info("web.dashboard_starting", port=port)
+            try:
+                await server.serve()
+            finally:
+                ready_task.cancel()
+                ready.set()
+
         try:
             loop.run_until_complete(_serve())
         finally:
