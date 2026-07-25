@@ -69,7 +69,6 @@ class TestConversation:
 
         t = MockTransport()
         sm = SessionManager(t, loopback=False, config=Config(openai_api_key="test-key"))
-        await sm.wait_for_device()
 
         mock_instance = AsyncMock()
         mock_instance.is_connected = True
@@ -83,7 +82,9 @@ class TestConversation:
         mock_instance.connect = AsyncMock()
         mock_instance.update_vad_settings = AsyncMock()
 
+        # Patch spans wait_for_device() so the HELLO_ACK prewarm uses the mock.
         with patch.object(rt_mod, "RealtimeClient", return_value=mock_instance):
+            await sm.wait_for_device()
             await sm.start_conversation()
             assert sm._audio_bridge is not None
             sm._audio_bridge._mic_muted = True
@@ -116,7 +117,6 @@ class TestConversation:
 
         t = MockTransport()
         sm = SessionManager(t, loopback=False, config=Config(openai_api_key="test-key"))
-        await sm.wait_for_device()
 
         mock_instance = AsyncMock()
         mock_instance.is_connected = True
@@ -133,7 +133,9 @@ class TestConversation:
         mock_instance.commit_input_buffer = AsyncMock()
 
         hello_pcm = b"\x00\x01" * 2400
+        # Patch spans wait_for_device() so the HELLO_ACK prewarm uses the mock.
         with patch.object(rt_mod, "RealtimeClient", return_value=mock_instance):
+            await sm.wait_for_device()
             await sm.start_conversation()
             cal_msg = create_message(
                 MessageType.CALIBRATION_COMPLETE,
@@ -489,7 +491,6 @@ class TestCalibrationTimeout:
 
         t = MockTransport()
         sm = SessionManager(t, loopback=False, config=Config(openai_api_key="test-key"))
-        await sm.wait_for_device()
 
         mock_instance = AsyncMock()
         mock_instance.is_connected = True
@@ -502,7 +503,9 @@ class TestCalibrationTimeout:
         mock_instance.iter_events = fake_iter
         mock_instance.connect = AsyncMock()
 
+        # Patch spans wait_for_device() so the HELLO_ACK prewarm uses the mock.
         with patch.object(rt_mod, "RealtimeClient", return_value=mock_instance):
+            await sm.wait_for_device()
             await sm.start_conversation()
             assert sm.state == SessionState.STREAMING
 

@@ -107,6 +107,7 @@ class AudioBridge:
         self._pending_greeting_playback = False
         self._opening_nudge_task: asyncio.Task[None] | None = None
         self._realtime_connect_task: asyncio.Task[None] | None = None
+        self._prewarm_connect_task: asyncio.Task[None] | None = None
         self._session_ready = False
 
     @property
@@ -308,6 +309,21 @@ class AudioBridge:
     def set_device_ready(self, ready: bool) -> None:
         """Gate device commands until HELLO → HELLO_ACK completes."""
         self._device_ready = ready
+
+    def adopt_prewarmed_realtime(
+        self,
+        client: Any,
+        connect_task: asyncio.Task[None] | None,
+    ) -> None:
+        """Take over a Realtime socket the session opened at HELLO_ACK.
+
+        _early_realtime_connect finishes this handshake instead of opening a
+        second socket, so the cold TLS/WS cost is already (mostly) paid by the
+        time calibration completes. Falls back to a fresh connect if the
+        pre-warmed socket went stale while the dashboard waited to Start.
+        """
+        self._realtime_client = client
+        self._prewarm_connect_task = connect_task
 
     @property
     def device_ready(self) -> bool:
@@ -641,11 +657,32 @@ class AudioBridge:
         log.info("audio_bridge.opening_nudge_sent")
 
     async def _early_realtime_connect(self) -> None:
-        """Open the Realtime WebSocket during device calibration."""
+        """Open (or adopt) the Realtime WebSocket during device calibration."""
         from voice_assistant.openai_client.realtime import RealtimeClient
 
         if self._realtime_client is not None:
-            return
+            # A socket pre-warmed by the session at HELLO_ACK: finish its
+            # handshake and wire up event processing without a second connect.
+            try:
+                if self._prewarm_connect_task is not None:
+                    await self._prewarm_connect_task
+                    self._prewarm_connect_task = None
+                if self._realtime_client.is_connected:
+                    if self._event_task is None:
+                        self._event_task = asyncio.create_task(
+                            self._process_realtime_events(),
+                            name="audio-bridge-realtime-events",
+                        )
+                    log.info(
+                        "audio_bridge.realtime_socket_connected", prewarmed=True
+                    )
+                    return
+                # Pre-warmed socket went stale; fall through to a fresh connect.
+                log.info("audio_bridge.realtime_prewarm_stale")
+            except Exception as exc:
+                log.warning("audio_bridge.realtime_prewarm_failed", error=str(exc))
+            self._prewarm_connect_task = None
+            self._realtime_client = None
 
         self._realtime_client = RealtimeClient(
             config=self._config,

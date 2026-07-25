@@ -58,6 +58,11 @@ class SessionManager:
         self._audio_bridge: AudioBridge | None = None
         self._handshake_complete = False
         self._calibration_metrics: dict[str, Any] | None = None
+        # OpenAI Realtime socket opened at HELLO_ACK so its (cold) TLS/WS
+        # handshake overlaps the whole device-ready -> Start window instead of
+        # only the brief calibration window. Handed to the AudioBridge on start.
+        self._prewarm_client: Any | None = None
+        self._prewarm_task: asyncio.Task[None] | None = None
 
     @property
     def transport(self) -> Transport:
@@ -189,6 +194,47 @@ class SessionManager:
             "device_info": hello.payload,
             "target": self._config.target,
         })
+        self._maybe_prewarm_realtime()
+
+    def _maybe_prewarm_realtime(self) -> None:
+        """Open the OpenAI Realtime socket now so its handshake is hidden.
+
+        Fired at HELLO_ACK. The socket is idle (no session.update yet) until the
+        AudioBridge adopts it on start_conversation and configures it with the
+        calibrated VAD settings. No-op in loopback / unconfigured mode.
+        """
+        if self._loopback or not self.is_openai_configured:
+            return
+        if self._prewarm_client is not None:
+            return
+
+        from voice_assistant.openai_client.realtime import RealtimeClient
+
+        client = RealtimeClient(config=self._config)
+        self._prewarm_client = client
+        self._prewarm_task = asyncio.create_task(
+            client.connect(send_session_update=False),
+            name="session-realtime-prewarm",
+        )
+        log.info("session.realtime_prewarm_started", session_id=self._session_id)
+
+    async def _discard_prewarm(self) -> None:
+        """Tear down an unconsumed prewarm socket (device lost / shutdown)."""
+        task = self._prewarm_task
+        client = self._prewarm_client
+        self._prewarm_task = None
+        self._prewarm_client = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
     async def start_conversation(self) -> None:
         """Send START_AUDIO_STREAM and transition to STREAMING."""
@@ -220,6 +266,13 @@ class SessionManager:
         elif resuming:
             await self._audio_bridge.resume_async(self._calibration_metrics)
         else:
+            if self._prewarm_client is not None:
+                self._audio_bridge.adopt_prewarmed_realtime(
+                    self._prewarm_client,
+                    self._prewarm_task,
+                )
+                self._prewarm_client = None
+                self._prewarm_task = None
             await self._audio_bridge.start_async()
 
         start_payload = {"skip_calibration": True} if resuming else None
@@ -330,6 +383,7 @@ class SessionManager:
         if self._state == SessionState.SHUTDOWN:
             return
 
+        await self._discard_prewarm()
         await self.stop_receive_loop()
 
         try:
@@ -410,6 +464,8 @@ class SessionManager:
         if self._audio_bridge is not None:
             await self._audio_bridge.reset_on_disconnect()
             self._audio_bridge = None
+
+        await self._discard_prewarm()
 
         previous_session_id = self._session_id
         self._handshake_complete = False

@@ -132,7 +132,6 @@ class TestAudioBridgeOpenAIMode:
         t = MockTransport()
         config = Config(openai_api_key="test-key")
         sm = SessionManager(t, loopback=False, config=config)
-        await sm.wait_for_device()
 
         mock_instance = AsyncMock()
         mock_instance.is_connected = True
@@ -146,7 +145,9 @@ class TestAudioBridgeOpenAIMode:
 
         import voice_assistant.openai_client.realtime as rt_mod
 
+        # Patch spans wait_for_device() so the HELLO_ACK prewarm uses the mock.
         with patch.object(rt_mod, "RealtimeClient", return_value=mock_instance):
+            await sm.wait_for_device()
             await sm.start_conversation()
 
         assert sm._audio_bridge is not None
@@ -241,7 +242,6 @@ class TestSessionManagerOpenAIIntegration:
         t = MockTransport()
         config = Config(openai_api_key="test-key")
         sm = SessionManager(t, loopback=False, config=config)
-        await sm.wait_for_device()
 
         mock_instance = AsyncMock()
         mock_instance.is_connected = True
@@ -255,7 +255,9 @@ class TestSessionManagerOpenAIIntegration:
         mock_instance.connect = AsyncMock()
         mock_instance.update_vad_settings = AsyncMock()
 
+        # Patch spans wait_for_device() so the HELLO_ACK prewarm uses the mock.
         with patch.object(rt_mod, "RealtimeClient", return_value=mock_instance):
+            await sm.wait_for_device()
             await sm.start_conversation()
 
             assert sm._audio_bridge is not None
