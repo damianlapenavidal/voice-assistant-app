@@ -14,12 +14,11 @@ from voice_assistant.audio.utils import (
     CALIBRATION_TIMEOUT_SEC,
     OPENING_NUDGE_WAIT_SEC,
     PLAY_AUDIO_CHUNK_BYTES,
-    base64_to_pcm16,
+    as_pcm_bytes,
     compute_recovery_ms,
     is_meaningful_user_text,
     likely_calibration_prompt_transcript,
     likely_echo_transcript,
-    pcm16_to_base64,
 )
 from voice_assistant.core.message import MessageType, create_message
 from voice_assistant.transport.base import Transport
@@ -454,7 +453,6 @@ class AudioBridge:
         if self._awaiting_opening_greeting:
             return
 
-        audio_b64 = payload.get("audio", "")
         t_start = time.monotonic()
         self._frame_count += 1
         if self._frame_count == 1:
@@ -470,8 +468,8 @@ class AudioBridge:
             )
             await self._transport.send_message(play_msg)
         elif self._realtime_client is not None and self._realtime_client.is_connected:
-            if audio_b64:
-                pcm_bytes = base64_to_pcm16(audio_b64)
+            pcm_bytes = as_pcm_bytes(payload.get("audio"))
+            if pcm_bytes:
                 log.debug(
                     "audio_bridge.forwarding_audio",
                     seq=payload.get("sequence_number"),
@@ -833,11 +831,12 @@ class AudioBridge:
             return
 
         duration_ms = int(len(pcm) / BYTE_RATE * 1000)
-        audio_b64 = pcm16_to_base64(pcm)
+        # Raw PCM: the transport base64s it only if this connection is on the
+        # JSON path, so a binary-framed device never pays for the encode.
         play_msg = create_message(
             MessageType.PLAY_AUDIO,
             {
-                "audio": audio_b64,
+                "audio": pcm,
                 "sequence_number": self._audio_seq,
                 "is_final": is_final,
                 "duration_ms": duration_ms,

@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import structlog
 
-from voice_assistant.audio.utils import base64_to_pcm16, compute_audio_level
+from voice_assistant.audio.utils import as_pcm_bytes, compute_audio_level
 from voice_assistant.config import Config, expected_device_type
 from voice_assistant.core.message import (
     Message,
@@ -25,6 +25,11 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 EventListener = Callable[[str, dict[str, Any]], None]
+
+# Capabilities this app can confirm in HELLO_ACK. A device advertising one in
+# HELLO gets it back only if it appears here, so adding a capability to the
+# device alone is never enough to change behaviour.
+NEGOTIABLE_CAPABILITIES = ("binary_audio",)
 
 
 class SessionState(Enum):
@@ -164,6 +169,7 @@ class SessionManager:
     async def _complete_handshake(self, hello: Message) -> None:
         self._verify_target(hello)
         self._session_id = str(uuid4())
+        negotiated = self._negotiate_capabilities(hello)
         ack = create_message(
             MessageType.HELLO_ACK,
             {
@@ -173,6 +179,7 @@ class SessionManager:
                     "format": "pcm16",
                     "channels": 1,
                 },
+                "negotiated_capabilities": negotiated,
             },
         )
         await self._transport.send_message(ack)
@@ -195,6 +202,27 @@ class SessionManager:
             "target": self._config.target,
         })
         self._maybe_prewarm_realtime()
+
+    def _negotiate_capabilities(self, hello: Message) -> list[str]:
+        """Intersect what the device offers with what this app supports.
+
+        The device only switches wire format once it sees its capability
+        confirmed here, so a device on older firmware -- or any device when
+        `binary_audio_frames` is off -- keeps the JSON path untouched. The
+        transport is told before HELLO_ACK goes out, since the very next
+        PLAY_AUDIO must already use the agreed format.
+        """
+        device_caps = set((hello.payload or {}).get("capabilities") or [])
+        negotiated = [
+            cap for cap in NEGOTIABLE_CAPABILITIES
+            if cap in device_caps and self._config.binary_audio_frames
+        ]
+
+        set_binary = getattr(self._transport, "set_binary_audio_enabled", None)
+        if set_binary is not None:
+            set_binary("binary_audio" in negotiated)
+
+        return negotiated
 
     def _maybe_prewarm_realtime(self) -> None:
         """Open the OpenAI Realtime socket now so its handshake is hidden.
@@ -522,9 +550,9 @@ class SessionManager:
                 if self._audio_bridge is not None:
                     await self._audio_bridge.handle_audio_frame(payload)
                 self._emit("audio_frame", payload)
-                audio_b64 = payload.get("audio", "")
-                if audio_b64:
-                    level, clipping = compute_audio_level(base64_to_pcm16(audio_b64))
+                audio_pcm = as_pcm_bytes(payload.get("audio"))
+                if audio_pcm:
+                    level, clipping = compute_audio_level(audio_pcm)
                     self._emit("audio_level", {
                         "level": round(level, 3),
                         "clipping": clipping,

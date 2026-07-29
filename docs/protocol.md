@@ -6,9 +6,9 @@ This document defines the communication protocol between the Raspberry Pi device
 
 ## Overview
 
-- All messages are **JSON objects** sent over the active transport.
+- All **control** messages are **JSON objects** sent over the active transport.
 - Every message has a required **`type`** field (string), an optional **`payload`** field (object), and an optional **`timestamp`** field (ISO 8601 string).
-- Binary audio data is **base64-encoded** inside the JSON payload, following the same pattern used by the OpenAI Realtime API.
+- Binary audio data is **base64-encoded** inside the JSON payload, following the same pattern used by the OpenAI Realtime API — **except** `AUDIO_FRAME` and `PLAY_AUDIO` on connections that negotiate the `binary_audio` capability, which use binary WebSocket frames instead. See [Binary Audio Framing](#binary-audio-framing).
 - Messages are newline-delimited when logged but are discrete units on the transport (one JSON object per WebSocket frame, for example).
 
 ### Why JSON?
@@ -18,7 +18,7 @@ This document defines the communication protocol between the Raspberry Pi device
 - **Simple.** No custom binary parser is required.
 - **Transport-friendly.** JSON works equally well over WebSocket text frames, Bluetooth serial streams, or any other channel.
 
-The ~33% size overhead of base64 encoding is acceptable over Wi-Fi. For bandwidth-constrained transports like BLE, raw binary framing can be introduced as a transport-level optimization without changing the protocol semantics.
+Those properties are worth keeping for control messages, which are low-rate and where readability matters most. They are *not* worth base64's ~33% size overhead on continuous audio: measured, a 100 ms / 4800-byte PCM chunk costs 6561 bytes as JSON+base64 — **26.8% overhead, both directions, on every chunk of every session**. That is why the two audio-carrying message types have a binary form, negotiated per connection so devices can migrate independently.
 
 ---
 
@@ -40,6 +40,88 @@ The ~33% size overhead of base64 encoding is acceptable over Wi-Fi. For bandwidt
 
 ---
 
+## Binary Audio Framing
+
+`AUDIO_FRAME` and `PLAY_AUDIO` — and **only** those two — may be sent as binary
+WebSocket frames carrying a fixed-width header followed by raw PCM16, instead of
+JSON with base64 audio. This eliminates the base64 + JSON envelope overhead
+measured above (26.8% → ~0.4%).
+
+> This is the one deliberate, sanctioned exception to the frozen message schema
+> noted in `voice-assistant-piZero2W/BRINGUP.md`. Every other message type, and
+> the JSON envelope itself, is unchanged.
+
+### Negotiation
+
+Binary framing is **opt-in per connection** and requires agreement from both sides:
+
+1. The device lists `"binary_audio"` in `HELLO`'s existing `capabilities` array.
+2. The app replies with `negotiated_capabilities` in `HELLO_ACK`, containing
+   `"binary_audio"` only if it also supports and has it enabled.
+3. Each side uses the binary form for **sending** only if the capability was
+   negotiated. A device that never advertises it (an unmodified Pi 5) keeps the
+   JSON path with no code change on its side.
+
+Receivers dispatch on the **WebSocket frame type** (binary vs text), not on the
+negotiated flag: what arrives reflects the peer's decision, and the frame type
+already encodes it unambiguously.
+
+The app can force JSON for every device regardless of what it advertises by
+setting `BINARY_AUDIO_FRAMES=false` — a kill switch that needs no device change.
+
+### `AUDIO_FRAME` header (device → app)
+
+18-byte header, all integers **big-endian**, then raw PCM16 to the end of the frame.
+
+| Offset | Size | Field | Value / meaning |
+|--------|------|-------|-----------------|
+| 0 | 1 | `msg_type` | `0x01` |
+| 1 | 1 | `header_version` | `0x01` |
+| 2 | 4 | `sequence_number` | u32, monotonic per stream |
+| 6 | 8 | `capture_timestamp_ms` | u64, Unix epoch milliseconds (UTC) |
+| 14 | 4 | `reserved` | u32, **must be 0** — see below |
+| 18 | … | `pcm` | raw PCM16, 24 kHz mono LE |
+
+### `PLAY_AUDIO` header (app → device)
+
+15-byte header, same conventions.
+
+| Offset | Size | Field | Value / meaning |
+|--------|------|-------|-----------------|
+| 0 | 1 | `msg_type` | `0x02` |
+| 1 | 1 | `header_version` | `0x01` |
+| 2 | 4 | `sequence_number` | u32 |
+| 6 | 1 | `flags` | bit 0 = `is_final`; bits 1–7 reserved, must be 0 |
+| 7 | 4 | `duration_ms` | u32; `0xFFFFFFFF` means "unknown" (JSON `null`) |
+| 11 | 4 | `reserved` | u32, **must be 0** |
+| 15 | … | `pcm` | raw PCM16; may be zero-length on a final empty chunk |
+
+### Why a type tag and version byte
+
+The WebSocket frame type already distinguishes binary from JSON, so these two
+bytes are not strictly needed to route a frame. They are kept because they cost
+2 bytes against a 4800-byte payload and they let a receiver reject a
+wrong-direction, corrupted, or future-format frame explicitly instead of
+misparsing it as the wrong shape.
+
+### Reserved fields
+
+The trailing `reserved` u32 in each header is earmarked for a future barge-in
+phase, which needs a playback/reference offset alongside the sequence number for
+echo alignment. It is placed last in both headers so assigning it meaning later
+shifts no existing field. **Do not repurpose it without bumping
+`header_version`.**
+
+### Malformed frames
+
+A binary frame that is too short, carries an unrecognized `msg_type`, or declares
+an unsupported `header_version` is treated as **recoverable**: the receiver logs
+it and drops the frame. It never tears down the session — dropping one 100 ms
+audio chunk is always better than ending a conversation. App-side this surfaces
+as a `MALFORMED_AUDIO_FRAME` `ERROR` message with `recoverable: true`.
+
+---
+
 ## Message Types
 
 ### Device to App
@@ -56,6 +138,16 @@ Sent by the device immediately after connecting. Announces the device and its ca
 | `device_type` | string | `"pi5"` or `"pi_zero_2w"` |
 | `firmware_version` | string | Firmware/software version on the device |
 | `capabilities` | string[] | List of supported features (e.g., `["audio_capture", "audio_playback"]`) |
+
+**Negotiable capabilities.** Most entries are informational, but some request a
+behaviour change the app must confirm in `HELLO_ACK`:
+
+| Capability | Effect if confirmed |
+|------------|--------------------|
+| `binary_audio` | `AUDIO_FRAME` / `PLAY_AUDIO` use [Binary Audio Framing](#binary-audio-framing) instead of JSON+base64 |
+
+A device omitting `binary_audio` — including any Pi 5 on unmodified firmware —
+stays on the JSON path automatically.
 
 **Example:**
 
@@ -116,7 +208,11 @@ A chunk of captured microphone audio. Sent continuously while the device is reco
 | `sequence_number` | integer | Monotonically increasing frame counter for ordering and gap detection |
 | `timestamp` | string (ISO 8601) | Capture timestamp on the device |
 
-**Example:**
+> Sent as a **binary frame** instead when `binary_audio` is negotiated — see
+> [Binary Audio Framing](#binary-audio-framing). The fields above are preserved
+> exactly; only their encoding changes.
+
+**JSON form** (used when `binary_audio` is not negotiated):
 
 ```json
 {
@@ -253,6 +349,7 @@ Acknowledges the device's `HELLO` message and provides session configuration.
 | `audio_config.sample_rate` | integer | Sample rate in Hz (always `24000`) |
 | `audio_config.format` | string | Audio format (always `"pcm16"`) |
 | `audio_config.channels` | integer | Number of audio channels (always `1`) |
+| `negotiated_capabilities` | string[] | Subset of the device's `HELLO` `capabilities` the app has confirmed. Empty when nothing was negotiated. The device must not change behaviour for a capability absent from this list. |
 
 **Example:**
 
@@ -265,7 +362,8 @@ Acknowledges the device's `HELLO` message and provides session configuration.
       "sample_rate": 24000,
       "format": "pcm16",
       "channels": 1
-    }
+    },
+    "negotiated_capabilities": ["binary_audio"]
   },
   "timestamp": "2026-06-30T15:00:00.050Z"
 }
@@ -328,7 +426,11 @@ Sends audio data for the device to play through its speaker. Typically contains 
 | `is_final` | boolean | When `true`, this is the complete AI response; device should drain playback and send `PLAYBACK_COMPLETE` |
 | `duration_ms` | integer (optional) | Estimated playback duration; informational for logging |
 
-**Example:**
+> Sent as a **binary frame** instead when `binary_audio` is negotiated — see
+> [Binary Audio Framing](#binary-audio-framing). An absent `duration_ms` is
+> carried there as the sentinel `0xFFFFFFFF`.
+
+**JSON form** (used when `binary_audio` is not negotiated):
 
 ```json
 {
@@ -512,6 +614,21 @@ A typical audio frame contains 20-100 ms of audio:
 
 Smaller frames reduce latency but increase per-frame overhead. The recommended default is 20-50 ms frames, tunable based on network conditions.
 
+**On the wire**, measured at the 100 ms / 4800-byte chunk the devices actually use:
+
+| Encoding | `AUDIO_FRAME` | `PLAY_AUDIO` | Overhead |
+|----------|--------------|-------------|----------|
+| JSON + base64 | 6,561 bytes | ~6,564 bytes | **26.8%** |
+| Binary framing | 4,818 bytes | 4,815 bytes | **~0.4%** |
+
+The JSON figures are 4,800 PCM → 6,400 base64 plus a ~161-byte envelope. The
+binary figures are the 18- and 15-byte headers from
+[Binary Audio Framing](#binary-audio-framing).
+
+> This is a **radio-airtime** optimization, not a CPU one. Measured on the Pi
+> Zero 2 W, base64 costs 0.07% of a core and `json.dumps` 0.14% — 0.25%
+> together, against a client that spends 3.4% while streaming.
+
 ---
 
 ## Error Codes
@@ -525,6 +642,7 @@ Device-side errors use string codes in the `ERROR` message's `code` field.
 | `SPEAKER_UNAVAILABLE` | Speaker hardware not found or inaccessible | No |
 | `SPEAKER_ERROR` | Speaker error during playback | Yes |
 | `AUDIO_FORMAT_ERROR` | Received audio in an unsupported format | Yes |
+| `MALFORMED_AUDIO_FRAME` | A binary `AUDIO_FRAME`/`PLAY_AUDIO` was truncated, carried an unrecognized type tag, or declared an unsupported header version. The frame is dropped; the session continues. | Yes |
 | `TRANSPORT_ERROR` | Transport-level communication failure | Depends on cause |
 | `LOW_BATTERY` | Battery level critically low | Yes (can continue briefly) |
 | `OVERTEMP` | CPU temperature exceeds safe threshold | Yes (device may throttle) |
@@ -601,7 +719,8 @@ The protocol is designed to evolve without breaking backward compatibility:
 
 - **New message types** can be added freely. Devices and apps should ignore message types they do not recognize.
 - **New payload fields** can be added to existing message types. Consumers should ignore fields they do not recognize.
-- **Version negotiation** can be added to the `HELLO`/`HELLO_ACK` exchange if breaking changes become necessary (e.g., adding a `protocol_version` field to the `HELLO` payload).
-- **Binary transport optimization.** For bandwidth-constrained transports like BLE, a binary framing layer can be introduced at the transport level, encoding the same logical messages without base64 overhead. The protocol semantics remain unchanged.
+- **Capability negotiation** is implemented: a device advertises a capability in `HELLO`'s `capabilities`, and the app confirms it in `HELLO_ACK`'s `negotiated_capabilities`. Add new negotiated behaviour through this exchange rather than a `protocol_version` field or a second round trip — it lets devices migrate independently, which is exactly why the Pi 5 and Pi Zero 2 W can run different wire formats against one app.
+- **Binary transport optimization** is implemented for `AUDIO_FRAME` and `PLAY_AUDIO` over WebSocket — see [Binary Audio Framing](#binary-audio-framing). Protocol semantics are unchanged; only those two message types' encoding differs, and only when negotiated. The same approach would apply to bandwidth-constrained transports like BLE.
+- **Reserved header space.** Both binary headers end with a reserved `u32` earmarked for a future barge-in phase (playback/reference offset for echo alignment). Do not repurpose it without bumping `header_version`.
 - **Additional device types.** The `device_type` field in `HELLO` can accommodate new hardware platforms beyond Pi 5 and Pi Zero 2 W.
 - **Extended capabilities.** The `capabilities` array in `HELLO` enables feature negotiation. New capabilities (e.g., `"camera"`, `"led_control"`, `"sensors"`) can be declared by future device firmware without protocol changes.

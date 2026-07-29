@@ -6,18 +6,38 @@ Runs a WebSocket server on the laptop. The Raspberry Pi connects as a client.
 from __future__ import annotations
 
 import asyncio
+import struct
+from datetime import datetime, timezone
 from typing import Any
 
 import structlog
 import websockets
 from websockets.asyncio.server import Server, ServerConnection
 
-from voice_assistant.core.message import Message, create_message, parse_message
+from voice_assistant.audio.utils import base64_to_pcm16, pcm16_to_base64
+from voice_assistant.core.message import (
+    Message,
+    MessageType,
+    create_message,
+    parse_message,
+)
 from voice_assistant.transport.base import Transport, TransportError
 
 log = structlog.get_logger()
 
 WS_MAX_FRAME_BYTES = 8 * 1024 * 1024
+
+# Binary AUDIO_FRAME/PLAY_AUDIO framing -- see docs/protocol.md's "Binary
+# Audio Framing" section. Only used once the device negotiates
+# "binary_audio"; the reserved trailing u32 in each header is earmarked for a
+# future barge-in phase and must stay 0 until then.
+AUDIO_FRAME_TAG = 0x01
+PLAY_AUDIO_TAG = 0x02
+HEADER_VERSION = 1
+_AUDIO_FRAME_STRUCT = struct.Struct(">BBIQI")  # tag, version, seq, ts_ms, reserved
+_PLAY_AUDIO_STRUCT = struct.Struct(">BBIBII")  # tag, version, seq, flags, duration_ms, reserved
+_FLAG_IS_FINAL = 0x01
+_DURATION_UNKNOWN = 0xFFFFFFFF
 
 
 class WebSocketTransport(Transport):
@@ -30,6 +50,17 @@ class WebSocketTransport(Transport):
         self._client: ServerConnection | None = None
         self._client_connected: asyncio.Event = asyncio.Event()
         self._serve_task: asyncio.Task[Any] | None = None
+        self._binary_audio_enabled = False
+
+    def set_binary_audio_enabled(self, enabled: bool) -> None:
+        """Choose the wire format for outbound PLAY_AUDIO on this connection.
+
+        Set once per connection from the HELLO/HELLO_ACK negotiation. Only
+        affects sending: inbound framing is whatever the device chose, which
+        its frame type already tells us.
+        """
+        self._binary_audio_enabled = enabled
+        log.info("ws_transport.binary_audio", enabled=enabled)
 
     async def start_server(self) -> None:
         """Start the WebSocket server without waiting for a device connection."""
@@ -113,29 +144,40 @@ class WebSocketTransport(Transport):
         log.info("ws_transport.disconnected")
 
     async def send_message(self, message: Message) -> None:
-        """Serialize a Message to JSON and send over WebSocket."""
+        """Send a Message, as a binary frame for negotiated PLAY_AUDIO and
+        JSON for everything else."""
         if self._client is None:
             raise TransportError("No device connected")
 
         try:
-            data = message.model_dump_json()
+            if self._binary_audio_enabled and message.type == MessageType.PLAY_AUDIO:
+                data: str | bytes = _encode_play_audio_binary(message)
+            else:
+                data = _json_with_encoded_audio(message)
             await self._client.send(data)
-            log.debug("ws_transport.sent", type=message.type.value)
+            log.debug("ws_transport.sent", type=message.type.value, bytes=len(data))
         except websockets.exceptions.ConnectionClosed as exc:
             self._client = None
             self._client_connected.clear()
             raise TransportError(f"Connection lost while sending: {exc}") from exc
 
     async def receive_message(self) -> Message:
-        """Receive JSON from WebSocket and parse into a Message."""
+        """Receive a Message, decoding binary AUDIO_FRAMEs and parsing
+        everything else as JSON.
+
+        Dispatch keys off the frame type rather than the negotiated flag: what
+        arrives reflects the device's choice, not ours.
+        """
         if self._client is None:
             raise TransportError("No device connected")
 
         try:
             raw = await self._client.recv()
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
-            msg = parse_message(raw)
+            msg = (
+                _decode_audio_frame_binary(raw)
+                if isinstance(raw, (bytes, bytearray))
+                else parse_message(raw)
+            )
             log.debug("ws_transport.received", type=msg.type.value)
             return msg
         except websockets.exceptions.ConnectionClosed as exc:
@@ -146,3 +188,82 @@ class WebSocketTransport(Transport):
     @property
     def is_connected(self) -> bool:
         return self._client is not None
+
+
+def _json_with_encoded_audio(message: Message) -> str:
+    """Serialize to JSON, base64-ing a raw-bytes `audio` field first.
+
+    Producers hand the transport raw PCM so the binary path can ship it
+    untouched. Pydantic would decode those bytes into a mangled string rather
+    than base64 them, so the JSON path has to encode explicitly -- otherwise a
+    device on the JSON path receives silently corrupted audio.
+    """
+    payload = message.payload
+    if payload is not None and isinstance(payload.get("audio"), (bytes, bytearray)):
+        message = message.model_copy(
+            update={"payload": {**payload, "audio": pcm16_to_base64(payload["audio"])}},
+        )
+    return message.model_dump_json()
+
+
+def _encode_play_audio_binary(message: Message) -> bytes:
+    """Pack a PLAY_AUDIO message into a binary frame (header + raw PCM)."""
+    payload = message.payload or {}
+    audio = payload.get("audio") or b""
+    pcm = audio if isinstance(audio, (bytes, bytearray)) else base64_to_pcm16(audio)
+    duration = payload.get("duration_ms")
+    header = _PLAY_AUDIO_STRUCT.pack(
+        PLAY_AUDIO_TAG,
+        HEADER_VERSION,
+        int(payload.get("sequence_number") or 0) & 0xFFFFFFFF,
+        _FLAG_IS_FINAL if payload.get("is_final") else 0,
+        _DURATION_UNKNOWN if duration is None else int(duration) & 0xFFFFFFFF,
+        0,
+    )
+    return header + bytes(pcm)
+
+
+def _decode_audio_frame_binary(raw: bytes) -> Message:
+    """Unpack a binary AUDIO_FRAME into the same Message a JSON one produces.
+
+    A malformed frame becomes a recoverable ERROR rather than an exception: a
+    raise here reads as connection loss to the session's receive loop, which
+    would tear down a live session over one bad audio chunk.
+    """
+    try:
+        if len(raw) < 2:
+            raise ValueError("frame shorter than 2-byte tag+version prefix")
+        tag, version = raw[0], raw[1]
+        if tag != AUDIO_FRAME_TAG:
+            raise ValueError(f"unexpected binary frame tag {tag:#04x}")
+        if version != HEADER_VERSION:
+            raise ValueError(f"unsupported AUDIO_FRAME header version {version}")
+        if len(raw) < _AUDIO_FRAME_STRUCT.size:
+            raise ValueError("truncated AUDIO_FRAME header")
+
+        _, _, seq, capture_ms, _reserved = _AUDIO_FRAME_STRUCT.unpack_from(raw, 0)
+        capture_iso = datetime.fromtimestamp(
+            capture_ms / 1000, tz=timezone.utc,
+        ).isoformat()
+        return Message(
+            type=MessageType.AUDIO_FRAME,
+            payload={
+                "audio": bytes(raw[_AUDIO_FRAME_STRUCT.size:]),
+                "sequence_number": seq,
+                "timestamp": capture_iso,
+            },
+        )
+    except (struct.error, ValueError, IndexError, OSError) as exc:
+        log.warning(
+            "ws_transport.malformed_binary_frame",
+            reason=str(exc),
+            frame_bytes=len(raw),
+        )
+        return create_message(
+            MessageType.ERROR,
+            {
+                "code": "MALFORMED_AUDIO_FRAME",
+                "message": str(exc),
+                "recoverable": True,
+            },
+        )
