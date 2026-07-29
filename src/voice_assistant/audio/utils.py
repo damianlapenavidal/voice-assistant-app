@@ -37,6 +37,19 @@ def base64_to_pcm16(b64_string: str) -> bytes:
     return base64.b64decode(b64_string)
 
 
+def as_pcm_bytes(audio: bytes | bytearray | str | None) -> bytes:
+    """Normalize a message payload's `audio` field to raw PCM16 bytes.
+
+    Audio arrives base64-encoded from a JSON AUDIO_FRAME and already raw from
+    a binary one, so consumers take either without caring which was negotiated.
+    """
+    if audio is None:
+        return b""
+    if isinstance(audio, (bytes, bytearray)):
+        return bytes(audio)
+    return base64_to_pcm16(audio)
+
+
 def generate_silence(duration_ms: int, sample_rate: int = SAMPLE_RATE) -> bytes:
     """Generate silent PCM16 audio (all-zero samples)."""
     num_samples = sample_rate * duration_ms // 1000

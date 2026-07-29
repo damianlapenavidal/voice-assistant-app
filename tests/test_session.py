@@ -1,9 +1,12 @@
 """Tests for session manager lifecycle."""
 
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 
+from voice_assistant.config import Config
+from voice_assistant.core.message import Message, MessageType, create_message
 from voice_assistant.core.session import SessionManager, SessionState
 from voice_assistant.transport.base import TransportError
 from voice_assistant.transport.mock_transport import MockTransport
@@ -596,3 +599,68 @@ class TestSessionFullLifecycle:
         await sm.shutdown_device()
         assert sm.state == SessionState.SHUTDOWN
         assert not t.is_connected
+
+
+class TestCapabilityNegotiation:
+    """HELLO/HELLO_ACK capability negotiation for binary audio framing."""
+
+    @staticmethod
+    def _hello(capabilities: list[str]) -> Message:
+        return create_message(MessageType.HELLO, {
+            "device_id": "test-device",
+            "device_type": "pi_zero_2w",
+            "firmware_version": "0.1.0",
+            "capabilities": capabilities,
+        })
+
+    async def test_binary_audio_negotiated_when_device_offers_it(self) -> None:
+        t = MockTransport()
+        await t.connect()
+        t.set_binary_audio_enabled = MagicMock()
+        sm = SessionManager(t, config=Config(openai_api_key="k"))
+
+        await sm._complete_handshake(
+            self._hello(["audio_capture", "audio_playback", "binary_audio"]),
+        )
+
+        ack = next(
+            m for m in t.sent_messages if m.type == MessageType.HELLO_ACK
+        )
+        assert ack.payload["negotiated_capabilities"] == ["binary_audio"]
+        t.set_binary_audio_enabled.assert_called_once_with(True)
+
+    async def test_pi5_shaped_hello_negotiates_nothing(self) -> None:
+        """A device that doesn't advertise binary_audio (an unmodified Pi 5)
+        must keep the JSON path."""
+        t = MockTransport()
+        await t.connect()
+        t.set_binary_audio_enabled = MagicMock()
+        sm = SessionManager(t, config=Config(openai_api_key="k"))
+
+        await sm._complete_handshake(self._hello(["audio_capture", "audio_playback"]))
+
+        ack = next(
+            m for m in t.sent_messages if m.type == MessageType.HELLO_ACK
+        )
+        assert ack.payload["negotiated_capabilities"] == []
+        t.set_binary_audio_enabled.assert_called_once_with(False)
+
+    async def test_kill_switch_forces_json_even_when_device_offers_binary(self) -> None:
+        """BINARY_AUDIO_FRAMES=false disables binary for every device without
+        needing a device-side change."""
+        t = MockTransport()
+        await t.connect()
+        t.set_binary_audio_enabled = MagicMock()
+        sm = SessionManager(
+            t, config=Config(openai_api_key="k", binary_audio_frames=False),
+        )
+
+        await sm._complete_handshake(
+            self._hello(["audio_capture", "audio_playback", "binary_audio"]),
+        )
+
+        ack = next(
+            m for m in t.sent_messages if m.type == MessageType.HELLO_ACK
+        )
+        assert ack.payload["negotiated_capabilities"] == []
+        t.set_binary_audio_enabled.assert_called_once_with(False)

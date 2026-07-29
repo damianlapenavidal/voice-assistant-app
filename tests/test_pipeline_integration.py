@@ -15,7 +15,7 @@ import pytest
 
 from voice_assistant.audio.bridge import AudioBridge, TAIL_SILENCE
 from voice_assistant.audio.utils import (
-    base64_to_pcm16,
+    as_pcm_bytes,
     generate_test_tone,
     pcm16_to_base64,
 )
@@ -115,7 +115,7 @@ class TestAudioBridgeOpenAIMode:
         # The reply plus a trailing silence pad is delivered across whole chunks,
         # with is_final on the last chunk only.
         delivered = b"".join(
-            base64_to_pcm16(c[0][0].payload["audio"]) for c in play_calls
+            as_pcm_bytes(c[0][0].payload["audio"]) for c in play_calls
         )
         assert delivered == pcm_response + TAIL_SILENCE
         assert play_calls[-1][0][0].payload["is_final"] is True

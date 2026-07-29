@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from voice_assistant.audio.bridge import AudioBridge, TAIL_SILENCE
-from voice_assistant.audio.utils import base64_to_pcm16, pcm16_to_base64
+from voice_assistant.audio.utils import as_pcm_bytes, pcm16_to_base64
 from voice_assistant.core.message import MessageType
 from voice_assistant.core.session import SessionManager, SessionState
 from voice_assistant.openai_client.realtime import (
@@ -440,7 +440,7 @@ class TestWholeChunkPlayback:
         # Audio is delivered as the reply followed by a trailing silence pad,
         # split across whole 4800-byte chunks with is_final on the last only.
         delivered = b"".join(
-            base64_to_pcm16(c[0][0].payload["audio"]) for c in play_calls
+            as_pcm_bytes(c[0][0].payload["audio"]) for c in play_calls
         )
         assert delivered == pcm1 + pcm2 + TAIL_SILENCE
         assert play_calls[-1][0][0].payload["is_final"] is True
@@ -537,7 +537,7 @@ class TestPlayAudioChunking:
         assert len(play_calls) == expected_chunks
 
         delivered = b"".join(
-            base64_to_pcm16(c[0][0].payload["audio"]) for c in play_calls
+            as_pcm_bytes(c[0][0].payload["audio"]) for c in play_calls
         )
         assert delivered == pcm + TAIL_SILENCE
 
@@ -1097,3 +1097,42 @@ class TestSessionManagerBridgeIntegration:
         sm = SessionManager(t, max_iterations=5, loopback=True)
         await sm.run_session_loop()
         assert sm.state == SessionState.SHUTDOWN
+
+
+class TestBinaryAndJsonAudioPayloads:
+    """handle_audio_frame accepts either payload representation.
+
+    Base64 str is what a JSON AUDIO_FRAME carries; raw bytes is what the
+    binary path hands over. Both must reach OpenAI as identical PCM.
+    """
+
+    @pytest.mark.parametrize("as_binary", [False, True], ids=["base64_str", "raw_bytes"])
+    async def test_audio_forwarded_identically_either_way(self, as_binary: bool) -> None:
+        pcm = b"\x01\x02\x03\x04\x05\x06"
+        transport = _make_mock_transport()
+        bridge = AudioBridge(transport, loopback=False)
+
+        realtime = AsyncMock()
+        realtime.is_connected = True
+        bridge._realtime_client = realtime
+        bridge.start()
+
+        audio = pcm if as_binary else pcm16_to_base64(pcm)
+        await bridge.handle_audio_frame(_frame_payload(audio=audio))
+
+        realtime.send_audio.assert_awaited_once_with(pcm)
+
+    async def test_play_audio_chunk_carries_raw_pcm(self) -> None:
+        """The bridge hands raw PCM to the transport, which owns the encode --
+        so a binary-framed device never pays for a base64 round trip."""
+        transport = _make_mock_transport()
+        bridge = AudioBridge(transport, loopback=False)
+        bridge.set_device_ready(True)
+
+        pcm = b"\xAA\xBB" * 8
+        await bridge._send_play_audio_chunk(pcm, is_final=True)
+
+        sent = transport.send_message.call_args[0][0]
+        assert sent.type == MessageType.PLAY_AUDIO
+        assert sent.payload["audio"] == pcm
+        assert sent.payload["is_final"] is True

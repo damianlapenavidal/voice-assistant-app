@@ -59,6 +59,10 @@ class Config:
     max_mock_iterations: int = 20
     web_enabled: bool = False
     web_port: int = 8080
+    # Kill switch for binary audio framing. Off forces JSON for every device
+    # regardless of what it advertises, without a device-side change or a
+    # rollback.
+    binary_audio_frames: bool = True
 
 
 def load_config() -> Config:
@@ -95,6 +99,8 @@ def load_config() -> Config:
         max_mock_iterations=int(os.getenv("MAX_MOCK_ITERATIONS", "20")),
         web_enabled=os.getenv("WEB_ENABLED", "false").lower() in ("true", "1", "yes"),
         web_port=int(os.getenv("WEB_PORT", "8080")),
+        binary_audio_frames=os.getenv("BINARY_AUDIO_FRAMES", "true").lower()
+        in ("true", "1", "yes"),
     )
 
 
