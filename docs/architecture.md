@@ -60,7 +60,7 @@ This design yields several important properties:
 | Session manager | Laptop | Orchestrates device + AI sessions |
 | OpenAI Realtime client | Laptop | Manages WebSocket to OpenAI |
 | Parent controls / config | Laptop | Settings, permissions, safety |
-| CLI (Phase 1) / Web UI (Phase 6+) | Laptop | Control panel for testing and monitoring |
+| CLI (Phase 1) + Web UI (`src/voice_assistant/web/`) | Laptop | Control panel for testing and monitoring |
 
 ---
 
@@ -234,7 +234,7 @@ Protocol messages are JSON objects with base64-encoded audio payloads. This appr
 
 ### CLI-first UI (Phase 1)
 
-The MVP uses a command-line interface. This eliminates frontend complexity and allows full focus on the core architecture. A web UI (FastAPI + HTML dashboard) is planned for Phase 6. The eventual phone app (Phase 8+) will likely use React Native or Flutter, but the core Python package is designed to be wrappable by a mobile backend or re-implementable in another language. The protocol itself is language-agnostic (JSON over WebSocket).
+The MVP started as a command-line interface; a FastAPI + HTML web dashboard (`src/voice_assistant/web/`, see `test_dashboard.py`) now exists alongside it for parent controls and monitoring. The eventual phone app (Phase 8+) will likely use React Native or Flutter, but the core Python package is designed to be wrappable by a mobile backend or re-implementable in another language. The protocol itself is language-agnostic (JSON over WebSocket).
 
 ---
 
