@@ -59,8 +59,12 @@ Binary framing is **opt-in per connection** and requires agreement from both sid
 2. The app replies with `negotiated_capabilities` in `HELLO_ACK`, containing
    `"binary_audio"` only if it also supports and has it enabled.
 3. Each side uses the binary form for **sending** only if the capability was
-   negotiated. A device that never advertises it (an unmodified Pi 5) keeps the
-   JSON path with no code change on its side.
+   negotiated. A device that never advertises it keeps the JSON path with no
+   code change on its side.
+
+Both device firmwares (Pi Zero 2 W and Pi 5) advertise `binary_audio` today, but
+they adopted it independently — which is the point of negotiating rather than
+versioning the protocol.
 
 Receivers dispatch on the **WebSocket frame type** (binary vs text), not on the
 negotiated flag: what arrives reflects the peer's decision, and the frame type
@@ -146,8 +150,8 @@ behaviour change the app must confirm in `HELLO_ACK`:
 |------------|--------------------|
 | `binary_audio` | `AUDIO_FRAME` / `PLAY_AUDIO` use [Binary Audio Framing](#binary-audio-framing) instead of JSON+base64 |
 
-A device omitting `binary_audio` — including any Pi 5 on unmodified firmware —
-stays on the JSON path automatically.
+A device omitting `binary_audio` stays on the JSON path automatically, with no
+app-side configuration.
 
 **Example:**
 
@@ -750,7 +754,7 @@ The protocol is designed to evolve without breaking backward compatibility:
 
 - **New message types** can be added freely. Devices and apps should ignore message types they do not recognize.
 - **New payload fields** can be added to existing message types. Consumers should ignore fields they do not recognize.
-- **Capability negotiation** is implemented: a device advertises a capability in `HELLO`'s `capabilities`, and the app confirms it in `HELLO_ACK`'s `negotiated_capabilities`. Add new negotiated behaviour through this exchange rather than a `protocol_version` field or a second round trip — it lets devices migrate independently, which is exactly why the Pi 5 and Pi Zero 2 W can run different wire formats against one app.
+- **Capability negotiation** is implemented: a device advertises a capability in `HELLO`'s `capabilities`, and the app confirms it in `HELLO_ACK`'s `negotiated_capabilities`. Add new negotiated behaviour through this exchange rather than a `protocol_version` field or a second round trip — it lets devices migrate independently, which is exactly why the Pi 5 and Pi Zero 2 W were able to adopt binary framing weeks apart while one app served both, and why a device on older firmware still works unchanged.
 - **Binary transport optimization** is implemented for `AUDIO_FRAME` and `PLAY_AUDIO` over WebSocket — see [Binary Audio Framing](#binary-audio-framing). Protocol semantics are unchanged; only those two message types' encoding differs, and only when negotiated. The same approach would apply to bandwidth-constrained transports like BLE.
 - **Reserved header space.** Both binary headers end with a reserved `u32` earmarked for a future barge-in phase (playback/reference offset for echo alignment). Do not repurpose it without bumping `header_version`.
 - **Additional device types.** The `device_type` field in `HELLO` can accommodate new hardware platforms beyond Pi 5 and Pi Zero 2 W.
