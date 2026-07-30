@@ -46,7 +46,7 @@ class TestMessageTypeEnum:
         assert MessageType[name].value == name
 
     def test_total_message_types(self) -> None:
-        assert len(MessageType) == 18
+        assert len(MessageType) == 19
 
 
 class TestCreateMessage:

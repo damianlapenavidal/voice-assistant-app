@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from voice_assistant.audio.bridge import AudioBridge, TAIL_SILENCE
-from voice_assistant.audio.utils import as_pcm_bytes, pcm16_to_base64
+from voice_assistant.audio.utils import as_pcm_bytes, generate_silence, pcm16_to_base64
 from voice_assistant.core.message import MessageType
 from voice_assistant.core.session import SessionManager, SessionState
 from voice_assistant.openai_client.realtime import (
@@ -1136,3 +1136,65 @@ class TestBinaryAndJsonAudioPayloads:
         assert sent.type == MessageType.PLAY_AUDIO
         assert sent.payload["audio"] == pcm
         assert sent.payload["is_final"] is True
+
+
+class TestHandleAudioGap:
+    """AUDIO_GAP synthesizes the silence a device elided (Phase 5b)."""
+
+    async def test_synthesizes_and_forwards_exact_silence(self) -> None:
+        transport = _make_mock_transport()
+        bridge = AudioBridge(transport, loopback=False)
+        bridge.start()
+
+        realtime = AsyncMock()
+        realtime.is_connected = True
+        bridge._realtime_client = realtime
+
+        await bridge.handle_audio_gap({"duration_ms": 500, "sequence_number": 10})
+
+        realtime.send_audio.assert_awaited_once_with(generate_silence(500))
+
+    async def test_noop_when_not_running(self) -> None:
+        transport = _make_mock_transport()
+        bridge = AudioBridge(transport, loopback=False)
+        realtime = AsyncMock()
+        realtime.is_connected = True
+        bridge._realtime_client = realtime
+
+        await bridge.handle_audio_gap({"duration_ms": 500, "sequence_number": 1})
+
+        realtime.send_audio.assert_not_awaited()
+
+    async def test_noop_during_calibration(self) -> None:
+        transport = _make_mock_transport()
+        bridge = AudioBridge(transport, loopback=False)
+        bridge.start()
+        bridge._awaiting_calibration = True
+        realtime = AsyncMock()
+        realtime.is_connected = True
+        bridge._realtime_client = realtime
+
+        await bridge.handle_audio_gap({"duration_ms": 500, "sequence_number": 1})
+
+        realtime.send_audio.assert_not_awaited()
+
+    async def test_noop_in_loopback(self) -> None:
+        transport = _make_mock_transport()
+        bridge = AudioBridge(transport, loopback=True)
+        bridge.start()
+
+        await bridge.handle_audio_gap({"duration_ms": 500, "sequence_number": 1})
+
+        transport.send_message.assert_not_called()
+
+    async def test_noop_when_duration_not_positive(self) -> None:
+        transport = _make_mock_transport()
+        bridge = AudioBridge(transport, loopback=False)
+        bridge.start()
+        realtime = AsyncMock()
+        realtime.is_connected = True
+        bridge._realtime_client = realtime
+
+        await bridge.handle_audio_gap({"duration_ms": 0, "sequence_number": 1})
+
+        realtime.send_audio.assert_not_awaited()

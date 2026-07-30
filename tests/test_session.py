@@ -1,7 +1,7 @@
 """Tests for session manager lifecycle."""
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -664,3 +664,25 @@ class TestCapabilityNegotiation:
         )
         assert ack.payload["negotiated_capabilities"] == []
         t.set_binary_audio_enabled.assert_called_once_with(False)
+
+
+class TestAudioGapDispatch:
+    """AUDIO_GAP messages route to AudioBridge.handle_audio_gap."""
+
+    async def test_audio_gap_dispatches_to_bridge(self) -> None:
+        t = MockTransport()
+        sm = SessionManager(t, loopback=True)
+        await sm.wait_for_device()
+        await sm.start_conversation()
+
+        sm._audio_bridge.handle_audio_gap = AsyncMock()
+
+        gap_msg = create_message(
+            MessageType.AUDIO_GAP,
+            {"duration_ms": 750, "sequence_number": 5, "reason": "silence"},
+        )
+        await sm._process_message(gap_msg, 1)
+
+        sm._audio_bridge.handle_audio_gap.assert_awaited_once_with(
+            {"duration_ms": 750, "sequence_number": 5, "reason": "silence"},
+        )

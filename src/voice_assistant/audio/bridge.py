@@ -16,6 +16,7 @@ from voice_assistant.audio.utils import (
     PLAY_AUDIO_CHUNK_BYTES,
     as_pcm_bytes,
     compute_recovery_ms,
+    generate_silence,
     is_meaningful_user_text,
     likely_calibration_prompt_transcript,
     likely_echo_transcript,
@@ -485,6 +486,34 @@ class AudioBridge:
             latency_ms=round(elapsed_ms, 2),
             frame_count=self._frame_count,
         )
+
+    async def handle_audio_gap(self, payload: dict) -> None:
+        """Synthesize the silence a device elided, so OpenAI's timeline stays intact.
+
+        The device only sends this once it has decided a chunk was silence
+        (Phase 5b); the app's job is purely to make that invisible downstream
+        by feeding OpenAI the same silence it would have received frame by
+        frame. Loopback mode doesn't need timeline fidelity for anything, so
+        it's a no-op there.
+        """
+        if not self._running or self._awaiting_calibration or self._awaiting_opening_greeting:
+            return
+        if self._loopback:
+            return
+
+        duration_ms = payload.get("duration_ms", 0)
+        if duration_ms <= 0:
+            return
+
+        if self._realtime_client is not None and self._realtime_client.is_connected:
+            silence = generate_silence(duration_ms)
+            log.debug(
+                "audio_bridge.synthesizing_gap",
+                duration_ms=duration_ms,
+                bytes=len(silence),
+                seq=payload.get("sequence_number"),
+            )
+            await self._realtime_client.send_audio(silence)
 
     async def handle_playback_complete(self, payload: dict) -> None:
         """Unmute mic after the device finishes playing a final response chunk."""
