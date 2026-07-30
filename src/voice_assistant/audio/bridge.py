@@ -77,6 +77,31 @@ BARGE_IN_WINDOW_MS = 700
 # response would be interrupted by listening windows every few hundred ms.
 BARGE_IN_MIN_SEGMENT_MS = 1500
 
+# --- Near-field voice level gate (Phase 7, step 1) -------------------------
+#
+# Goal: don't answer the parent across the room. The cheap signal the plan says
+# to exhaust before reaching for a speaker-verification model is distance: the
+# child is at the device, everyone else is further away, and §3 measured the
+# child's speech at +10.2 dB over ambient at that position. The RMS is already
+# being computed, so this costs nothing new.
+#
+# Levels are always logged; dropping frames is opt-in (`VOICE_LEVEL_GATE`) and
+# off by default. That ordering is deliberate and is the plan's own: **a
+# rejection that is never transmitted cannot be reviewed**, so the data needed to
+# tune the threshold has to be gathered before the threshold is allowed to act.
+#
+# Threshold sits partway between the noise floor and the enrolled speech peak
+# that calibration already measures on-device. Plain speech detection is lower
+# than this on purpose -- a distant voice clears the noise floor easily but not
+# the near-field level.
+NEAR_FIELD_THRESHOLD_FRACTION = 0.5
+# Once a frame is accepted, keep accepting for this long. Speech is not uniformly
+# loud -- unstressed syllables and trailing words dip well below the threshold --
+# and the plan is explicit that the failure asymmetry runs one way: a false
+# reject means the child is ignored and the product feels broken, which is worse
+# than answering the wrong person. Bias permissive.
+NEAR_FIELD_HOLD_MS = 800
+
 TranscriptCallback = Callable[[str, str, bool], None]
 MicMuteCallback = Callable[[bool], None]
 ConversationStateCallback = Callable[[str], None]
@@ -153,6 +178,15 @@ class AudioBridge:
         self._segment_ms_sent = 0
         self._finalize_deferred = False
         self._listen_window_task: asyncio.Task[None] | None = None
+
+        # Near-field level gate (Phase 7, step 1). The threshold arrives with
+        # the device's calibration; until then nothing is judged.
+        self._level_gate_enabled = bool(getattr(config, "voice_level_gate", False))
+        self._near_field_threshold: float | None = None
+        self._near_field_hold_until = 0.0
+        self._level_stats_accepted = 0
+        self._level_stats_rejected = 0
+        self._level_stats_peak = 0.0
 
     @property
     def frame_count(self) -> int:
@@ -479,10 +513,22 @@ class AudioBridge:
         self._quiet_chunk_run = 0
         self._segment_ms_sent = 0
 
+    def _reset_level_gate_state(self) -> None:
+        """Forget the near-field threshold (Phase 7).
+
+        It is calibrated per session against this room and this speaker; carrying
+        it into a fresh session -- possibly a different room -- would gate on a
+        measurement that no longer describes anything.
+        """
+        self._log_level_gate_summary()
+        self._near_field_threshold = None
+        self._near_field_hold_until = 0.0
+
     async def reset_on_disconnect(self) -> None:
         """Tear down playback/OpenAI state without sending device commands."""
         self._cancel_unmute_timeout()
         self._reset_barge_in_state()
+        self._reset_level_gate_state()
         self._device_ready = False
         self._pending_playback_seq = None
         self._ai_speaking = False
@@ -538,6 +584,17 @@ class AudioBridge:
         elif self._realtime_client is not None and self._realtime_client.is_connected:
             pcm_bytes = as_pcm_bytes(payload.get("audio"))
             if pcm_bytes:
+                near_field = self._classify_near_field(pcm_bytes)
+                if near_field is False and self._level_gate_enabled:
+                    # Too quiet to be the child at the device. Dropped rather
+                    # than forwarded -- but only because the gate was explicitly
+                    # turned on; the classification happens either way so the
+                    # logs can be reviewed before it is.
+                    log.debug(
+                        "audio_bridge.frame_gated_far_field",
+                        seq=payload.get("sequence_number"),
+                    )
+                    return
                 log.debug(
                     "audio_bridge.forwarding_audio",
                     seq=payload.get("sequence_number"),
@@ -553,6 +610,58 @@ class AudioBridge:
             latency_ms=round(elapsed_ms, 2),
             frame_count=self._frame_count,
         )
+
+    def _classify_near_field(self, pcm_bytes: bytes) -> bool | None:
+        """Is this frame loud enough to be the child at the device?
+
+        Returns None while there is nothing to judge against (before
+        calibration), which callers must treat as "don't gate" -- an unknown
+        threshold is not evidence of a far-field speaker.
+
+        Counts every verdict for the per-turn summary regardless of whether the
+        gate is enabled: gathering that record *is* step 1 of Phase 7.
+        """
+        if self._near_field_threshold is None:
+            return None
+
+        level = chunk_rms(pcm_bytes, stride=4)
+        self._level_stats_peak = max(self._level_stats_peak, level)
+
+        now = time.monotonic()
+        if level >= self._near_field_threshold:
+            self._near_field_hold_until = now + NEAR_FIELD_HOLD_MS / 1000.0
+            self._level_stats_accepted += 1
+            return True
+        if now < self._near_field_hold_until:
+            # Mid-utterance dip, not a new speaker. Held open deliberately.
+            self._level_stats_accepted += 1
+            return True
+
+        self._level_stats_rejected += 1
+        return False
+
+    def _log_level_gate_summary(self) -> None:
+        """Emit one reviewable line per user turn, then reset the counters.
+
+        Per-frame lines are debug-only -- a 15 s turn is ~150 frames, which is
+        not something anyone will read. This summary is the artifact Phase 7's
+        "evaluate from real logs" step is meant to consume, which is why it is
+        logged at info level even when the gate is doing nothing.
+        """
+        total = self._level_stats_accepted + self._level_stats_rejected
+        if total == 0:
+            return
+        log.info(
+            "audio_bridge.voice_level_summary",
+            near_field_frames=self._level_stats_accepted,
+            far_field_frames=self._level_stats_rejected,
+            peak_rms=round(self._level_stats_peak, 1),
+            threshold=round(self._near_field_threshold or 0.0, 1),
+            gate_enforcing=self._level_gate_enabled,
+        )
+        self._level_stats_accepted = 0
+        self._level_stats_rejected = 0
+        self._level_stats_peak = 0.0
 
     async def handle_audio_gap(self, payload: dict) -> None:
         """Synthesize the silence a device elided, so OpenAI's timeline stays intact.
@@ -675,6 +784,19 @@ class AudioBridge:
             vad_eagerness=vad_settings.eagerness,
             vad_threshold=vad_settings.threshold,
             silence_ms=vad_settings.silence_ms,
+        )
+
+        # Near-field threshold (Phase 7): partway between the ambient floor and
+        # the level the child actually spoke at during calibration.
+        self._near_field_threshold = (
+            noise_floor + voice_margin * NEAR_FIELD_THRESHOLD_FRACTION
+        )
+        log.info(
+            "audio_bridge.near_field_threshold_set",
+            threshold=round(self._near_field_threshold, 1),
+            noise_floor=noise_floor,
+            user_speech_peak=user_speech_peak,
+            gate_enforcing=self._level_gate_enabled,
         )
 
         self._calibration_phase = None
@@ -1220,6 +1342,7 @@ class AudioBridge:
                     if self._should_ignore_live_speech_vad():
                         log.debug("audio_bridge.speech_stopped_ignored")
                         continue
+                    self._log_level_gate_summary()
                     self._flush_buffered_transcripts()
                     self._awaiting_user_transcript = True
                     self._schedule_user_transcript_timeout()

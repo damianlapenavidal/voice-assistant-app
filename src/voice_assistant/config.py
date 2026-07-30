@@ -68,6 +68,13 @@ class Config:
     # Off by default -- it changes response pacing and costs radio time, both of
     # which want judging by ear on real hardware before becoming the default.
     barge_in: bool = False
+    # Phase 7 of the battery plan: reject audio that is too quiet to be the
+    # child at the device, so parents across the room and background chatter
+    # don't get answered. Off by default *on purpose* -- the levels are logged
+    # either way, and the plan's own order is to gather real logs before letting
+    # anything be dropped, because a rejection that is never transmitted cannot
+    # be reviewed.
+    voice_level_gate: bool = False
 
 
 def load_config() -> Config:
@@ -107,6 +114,8 @@ def load_config() -> Config:
         binary_audio_frames=os.getenv("BINARY_AUDIO_FRAMES", "true").lower()
         in ("true", "1", "yes"),
         barge_in=os.getenv("BARGE_IN", "false").lower() in ("true", "1", "yes"),
+        voice_level_gate=os.getenv("VOICE_LEVEL_GATE", "false").lower()
+        in ("true", "1", "yes"),
     )
 
 

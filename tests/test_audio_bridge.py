@@ -1593,3 +1593,166 @@ class TestBargeInEndToEnd:
         assert bridge._mic_muted is False  # the user has the floor
         assert bridge._barge_in_detected is False  # cleared by response.done
         assert len(bridge._audio_buffer) == 0
+
+
+class TestNearFieldLevelGate:
+    """Phase 7 step 1: classify incoming frames by level, log first, gate later."""
+
+    def _level_config(self, enforcing: bool):
+        from voice_assistant.config import Config
+
+        return Config(openai_api_key="", voice_level_gate=enforcing)
+
+    async def _calibrated_bridge(self, *, enforcing: bool):
+        transport = _make_mock_transport()
+        bridge = AudioBridge(
+            transport, loopback=False, config=self._level_config(enforcing),
+        )
+        bridge.start()
+        realtime = AsyncMock()
+        realtime.is_connected = True
+        bridge._realtime_client = realtime
+        # noise_floor 300, peak 900 -> margin 600 -> threshold 300 + 300 = 600
+        bridge._near_field_threshold = 600.0
+        return transport, bridge, realtime
+
+    def test_gate_is_off_by_default(self) -> None:
+        bridge = AudioBridge(_make_mock_transport(), loopback=False)
+        assert bridge._level_gate_enabled is False
+
+    async def test_threshold_derived_from_calibration(self) -> None:
+        from voice_assistant.audio.bridge import NEAR_FIELD_THRESHOLD_FRACTION
+
+        transport = _make_mock_transport()
+        bridge = AudioBridge(transport, loopback=False, config=self._level_config(False))
+        bridge.start()
+        bridge._realtime_client = AsyncMock()
+        bridge._realtime_client.is_connected = True
+
+        accepted = await bridge.handle_calibration_complete({
+            "speech_detected": True,
+            "noise_floor": 300.0,
+            "user_speech_peak": 900.0,
+        })
+
+        assert accepted is True
+        expected = 300.0 + 600.0 * NEAR_FIELD_THRESHOLD_FRACTION
+        assert bridge._near_field_threshold == pytest.approx(expected)
+
+    async def test_no_verdict_before_calibration(self) -> None:
+        """An unknown threshold is not evidence of a far-field speaker."""
+        transport = _make_mock_transport()
+        bridge = AudioBridge(transport, loopback=False, config=self._level_config(True))
+        bridge.start()
+        realtime = AsyncMock()
+        realtime.is_connected = True
+        bridge._realtime_client = realtime
+
+        assert bridge._classify_near_field(_speech(100)) is None
+        await bridge.handle_audio_frame(
+            {"audio": _quiet(100), "sequence_number": 1},
+        )
+        # Nothing is gated while there is nothing to gate against.
+        realtime.send_audio.assert_awaited_once()
+
+    async def test_loud_near_field_speech_is_accepted(self) -> None:
+        import struct
+
+        _t, bridge, realtime = await self._calibrated_bridge(enforcing=True)
+        loud = struct.pack("<h", 4000) * 1200
+
+        await bridge.handle_audio_frame({"audio": loud, "sequence_number": 1})
+
+        realtime.send_audio.assert_awaited_once_with(loud)
+        assert bridge._level_stats_accepted == 1
+        assert bridge._level_stats_rejected == 0
+
+    async def test_far_field_frame_is_counted_but_not_dropped_when_logging_only(
+        self,
+    ) -> None:
+        """The whole point of step 1: measure without acting, so the threshold
+        can be judged from real logs before it is allowed to reject anything."""
+        import struct
+
+        _t, bridge, realtime = await self._calibrated_bridge(enforcing=False)
+        distant = struct.pack("<h", 100) * 1200  # RMS 100, well under 600
+
+        await bridge.handle_audio_frame({"audio": distant, "sequence_number": 1})
+
+        realtime.send_audio.assert_awaited_once_with(distant)
+        assert bridge._level_stats_rejected == 1
+
+    async def test_far_field_frame_is_dropped_when_enforcing(self) -> None:
+        import struct
+
+        _t, bridge, realtime = await self._calibrated_bridge(enforcing=True)
+        distant = struct.pack("<h", 100) * 1200
+
+        await bridge.handle_audio_frame({"audio": distant, "sequence_number": 1})
+
+        realtime.send_audio.assert_not_awaited()
+        assert bridge._level_stats_rejected == 1
+
+    async def test_hold_keeps_a_mid_utterance_dip_from_being_cut(self) -> None:
+        """Speech is not uniformly loud. Once accepted, a quiet syllable must not
+        be treated as a different, distant speaker -- the failure asymmetry runs
+        against false rejects."""
+        import struct
+
+        _t, bridge, realtime = await self._calibrated_bridge(enforcing=True)
+        loud = struct.pack("<h", 4000) * 1200
+        dip = struct.pack("<h", 100) * 1200
+
+        await bridge.handle_audio_frame({"audio": loud, "sequence_number": 1})
+        await bridge.handle_audio_frame({"audio": dip, "sequence_number": 2})
+
+        assert realtime.send_audio.await_count == 2
+        assert bridge._level_stats_rejected == 0
+
+    async def test_hold_expires(self) -> None:
+        import struct
+        from unittest.mock import patch
+
+        _t, bridge, realtime = await self._calibrated_bridge(enforcing=True)
+        loud = struct.pack("<h", 4000) * 1200
+        dip = struct.pack("<h", 100) * 1200
+
+        with patch("voice_assistant.audio.bridge.NEAR_FIELD_HOLD_MS", 0):
+            await bridge.handle_audio_frame({"audio": loud, "sequence_number": 1})
+            await bridge.handle_audio_frame({"audio": dip, "sequence_number": 2})
+
+        assert realtime.send_audio.await_count == 1
+        assert bridge._level_stats_rejected == 1
+
+    async def test_summary_resets_counters(self) -> None:
+        import struct
+
+        _t, bridge, _r = await self._calibrated_bridge(enforcing=False)
+        await bridge.handle_audio_frame(
+            {"audio": struct.pack("<h", 4000) * 1200, "sequence_number": 1},
+        )
+        assert bridge._level_stats_accepted == 1
+
+        bridge._log_level_gate_summary()
+
+        assert bridge._level_stats_accepted == 0
+        assert bridge._level_stats_rejected == 0
+        assert bridge._level_stats_peak == 0.0
+
+    async def test_threshold_is_forgotten_on_disconnect(self) -> None:
+        """It describes one room and one speaker; a fresh session recalibrates."""
+        _t, bridge, _r = await self._calibrated_bridge(enforcing=True)
+        assert bridge._near_field_threshold is not None
+
+        await bridge.reset_on_disconnect()
+
+        assert bridge._near_field_threshold is None
+
+    async def test_synthesized_gap_silence_is_never_gated(self) -> None:
+        """AUDIO_GAP exists to keep OpenAI's timeline faithful (Phase 5b). Its
+        silence is silence by definition -- gating it would defeat the point."""
+        _t, bridge, realtime = await self._calibrated_bridge(enforcing=True)
+
+        await bridge.handle_audio_gap({"duration_ms": 500, "sequence_number": 3})
+
+        realtime.send_audio.assert_awaited_once_with(generate_silence(500))
