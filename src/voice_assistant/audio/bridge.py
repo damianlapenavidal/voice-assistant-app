@@ -15,6 +15,7 @@ from voice_assistant.audio.utils import (
     OPENING_NUDGE_WAIT_SEC,
     PLAY_AUDIO_CHUNK_BYTES,
     as_pcm_bytes,
+    chunk_rms,
     compute_recovery_ms,
     generate_silence,
     is_meaningful_user_text,
@@ -43,6 +44,38 @@ TAIL_SILENCE = b"\x00" * (int(BYTE_RATE * PLAYBACK_TAIL_SILENCE_MS / 1000) & ~1)
 # — empty/failed transcription, or it was filtered as echo/calibration noise —
 # release the held assistant lines after this timeout so nothing is dropped.
 USER_TRANSCRIPT_TIMEOUT_SEC = 5.0
+
+# --- Barge-in (Phase 6a of the battery plan) -------------------------------
+#
+# The mic is muted while the assistant speaks, because the echo of the device's
+# own speaker would otherwise be heard as the user talking. Phase 6a's way out
+# is to listen only in the pauses of the assistant's own speech: the echo tail
+# was measured at <50 ms, so once the speaker has actually gone quiet the mic is
+# usable at full volume with no ducking, no echo canceller and no new hardware.
+#
+# The hard part is knowing when the speaker is *actually* quiet. Audio arrives
+# from OpenAI far faster than real time, so a pause the app sees in the outgoing
+# stream is not a pause happening now at the speaker, and the wire latency
+# between them (SSH tunnel + aplay's own ALSA buffer) is both unknown and
+# variable -- estimating it would spend the entire echo margin on guesswork.
+#
+# So the app does not estimate. It *creates* the boundary: it ends the segment
+# at the pause with `is_final=True`, which makes the device drain playback and
+# reply PLAYBACK_COMPLETE. That reply is an exact, latency-free "the speaker has
+# stopped" signal, and the app already handles it. The listening window opens
+# there. Nothing is playing during it, which is also why interrupting needs no
+# stop-playback message: the app simply never sends the rest of the response.
+BARGE_IN_SILENCE_RMS = 200.0
+# 100 ms chunks. Four of them is a pause long enough to be a real phrase or
+# sentence boundary rather than a stop consonant, which keeps the assistant from
+# being chopped up mid-word.
+BARGE_IN_MIN_GAP_CHUNKS = 4
+# How long to hold the mic open at a boundary. Long enough for a child to start
+# a word, short enough that the pause does not read as the assistant hanging.
+BARGE_IN_WINDOW_MS = 700
+# Floor on how often a response may be segmented. Without it a slow, pause-heavy
+# response would be interrupted by listening windows every few hundred ms.
+BARGE_IN_MIN_SEGMENT_MS = 1500
 
 TranscriptCallback = Callable[[str, str, bool], None]
 MicMuteCallback = Callable[[bool], None]
@@ -109,6 +142,17 @@ class AudioBridge:
         self._realtime_connect_task: asyncio.Task[None] | None = None
         self._prewarm_connect_task: asyncio.Task[None] | None = None
         self._session_ready = False
+
+        # Barge-in (Phase 6a). Loopback has no response to interrupt, so it is
+        # excluded regardless of the flag.
+        self._barge_in_enabled = bool(getattr(config, "barge_in", False)) and not loopback
+        self._quiet_chunk_run = 0
+        self._listening_for_barge_in = False
+        self._awaiting_segment_playback = False
+        self._barge_in_detected = False
+        self._segment_ms_sent = 0
+        self._finalize_deferred = False
+        self._listen_window_task: asyncio.Task[None] | None = None
 
     @property
     def frame_count(self) -> int:
@@ -298,6 +342,12 @@ class AudioBridge:
 
     def _should_ignore_live_speech_vad(self) -> bool:
         """Ignore server VAD while the AI speaks or greets — not for the live mic."""
+        if self._listening_for_barge_in:
+            # A barge-in window (Phase 6a): the segment has drained, so the
+            # speaker is quiet and VAD firing here is the user, not the echo.
+            # This has to come before the _ai_speaking check below, which is
+            # otherwise still true for the response we are in the middle of.
+            return False
         if self._ai_speaking:
             return True
         if time.monotonic() < self._recovery_until:
@@ -408,14 +458,31 @@ class AudioBridge:
         self._cancel_unmute_timeout()
         self._cancel_opening_nudge_task()
         self._cancel_calibration_watchdog()
+        self._reset_barge_in_state()
         if self._mic_muted and self._device_ready:
             await self._send_mute(False)
         self.stop()
         await self._disconnect_realtime()
 
+    def _reset_barge_in_state(self) -> None:
+        """Drop any in-flight barge-in boundary (Phase 6a).
+
+        A listening window left running across a stop or a device disconnect
+        would send MUTE_MIC to a device that is gone, and would resume flushing a
+        response nobody is listening to.
+        """
+        self._cancel_listen_window()
+        self._listening_for_barge_in = False
+        self._awaiting_segment_playback = False
+        self._barge_in_detected = False
+        self._finalize_deferred = False
+        self._quiet_chunk_run = 0
+        self._segment_ms_sent = 0
+
     async def reset_on_disconnect(self) -> None:
         """Tear down playback/OpenAI state without sending device commands."""
         self._cancel_unmute_timeout()
+        self._reset_barge_in_state()
         self._device_ready = False
         self._pending_playback_seq = None
         self._ai_speaking = False
@@ -528,6 +595,17 @@ class AudioBridge:
 
         self._cancel_unmute_timeout()
         self._pending_playback_seq = None
+
+        if self._awaiting_segment_playback:
+            # Not the end of the reply -- the end of a segment we deliberately
+            # cut at a pause. The device has drained, so the speaker is now
+            # genuinely quiet and the mic can be trusted for a moment.
+            self._cancel_listen_window()
+            self._listen_window_task = asyncio.create_task(
+                self._open_barge_in_window(),
+                name="audio-bridge-barge-in-window",
+            )
+            return
 
         if self._mic_muted:
             self._ai_speaking = False
@@ -874,6 +952,7 @@ class AudioBridge:
         await self._transport.send_message(play_msg)
         self._chunks_sent_this_response += 1
         self._response_duration_ms += duration_ms
+        self._segment_ms_sent += duration_ms
         log.info(
             "audio_bridge.play_audio_sent",
             seq=self._audio_seq,
@@ -885,15 +964,147 @@ class AudioBridge:
     async def _flush_partial_chunks(self) -> None:
         """Send full 4800-byte chunks while more data may still arrive."""
         while True:
+            if self._listening_for_barge_in or self._awaiting_segment_playback:
+                # A barge-in boundary is in flight: the device is either
+                # draining the segment we just ended or has the mic open in the
+                # pause after it. Either way the rest of the response waits --
+                # sending it now would refill the speaker and close the window.
+                return
             async with self._buffer_lock:
                 if len(self._audio_buffer) < PLAY_AUDIO_CHUNK_BYTES:
                     return
                 chunk = bytes(self._audio_buffer[:PLAY_AUDIO_CHUNK_BYTES])
                 del self._audio_buffer[:PLAY_AUDIO_CHUNK_BYTES]
+            if self._is_barge_in_boundary(chunk):
+                await self._end_segment_for_barge_in(chunk)
+                return
             await self._send_play_audio_chunk(chunk, is_final=False)
+
+    def _is_barge_in_boundary(self, chunk: bytes) -> bool:
+        """Is this chunk the end of a pause long enough to listen in?
+
+        Counts consecutive quiet chunks and reports the boundary once the run is
+        long enough *and* enough of the response has played since the last one.
+        Called for every outgoing chunk, so it stays an RMS with stride 4 -- the
+        same cheap approximation Phase 5b's device-side gate uses.
+        """
+        if not self._barge_in_enabled:
+            return False
+
+        if chunk_rms(chunk, stride=4) >= BARGE_IN_SILENCE_RMS:
+            self._quiet_chunk_run = 0
+            return False
+
+        self._quiet_chunk_run += 1
+        if self._quiet_chunk_run < BARGE_IN_MIN_GAP_CHUNKS:
+            return False
+
+        # Measured in audio *delivered*, not wall clock. Audio arrives from
+        # OpenAI far faster than real time, so a wall-clock floor here would be
+        # ~0 ms for the whole response and never suppress anything -- the same
+        # confusion between send time and playback time this design exists to
+        # avoid.
+        if self._segment_ms_sent < BARGE_IN_MIN_SEGMENT_MS:
+            return False
+
+        return True
+
+    async def _end_segment_for_barge_in(self, chunk: bytes) -> None:
+        """Close the current segment at a pause so the device drains and replies.
+
+        The reply (PLAYBACK_COMPLETE for this sequence number) is what opens the
+        listening window -- see handle_playback_complete.
+        """
+        self._quiet_chunk_run = 0
+        self._segment_ms_sent = 0
+        self._awaiting_segment_playback = True
+        self._pending_playback_seq = self._audio_seq
+        await self._send_play_audio_chunk(chunk, is_final=True)
+        log.info(
+            "audio_bridge.barge_in_segment_ended",
+            seq=self._audio_seq,
+            buffered_bytes=len(self._audio_buffer),
+        )
+
+    async def _open_barge_in_window(self) -> None:
+        """Unmute at a drained segment boundary, listen, then carry on.
+
+        Incoming frames during the window reach OpenAI through the ordinary
+        handle_audio_frame path; its own turn detection (semantic_vad with
+        interrupt_response) is what decides whether they were an interruption.
+        This method only decides *when* the mic is trustworthy.
+        """
+        self._listening_for_barge_in = True
+        self._awaiting_segment_playback = False
+        await self._send_mute(False)
+        log.info("audio_bridge.barge_in_window_open", window_ms=BARGE_IN_WINDOW_MS)
+
+        try:
+            await asyncio.sleep(BARGE_IN_WINDOW_MS / 1000.0)
+        except asyncio.CancelledError:
+            # Cancelled means a barge-in landed; _handle_barge_in owns the
+            # cleanup, so leave the mic open for the user who is now talking.
+            raise
+
+        self._listening_for_barge_in = False
+        if self._barge_in_detected:
+            return
+
+        await self._send_mute(True)
+        # Next segment gets its own sequence number so its PLAYBACK_COMPLETE
+        # can't be confused with the one we just consumed.
+        self._audio_seq += 1
+        log.info("audio_bridge.barge_in_window_closed", resumed_seq=self._audio_seq)
+        await self._flush_partial_chunks()
+        if self._finalize_deferred:
+            # The reply finished generating during the window; its held tail is
+            # flushed now that the speaker is ours again.
+            self._finalize_deferred = False
+            await self._finalize_response_audio()
+
+    def _cancel_listen_window(self) -> None:
+        if self._listen_window_task is not None:
+            self._listen_window_task.cancel()
+            self._listen_window_task = None
+
+    async def _handle_barge_in(self) -> None:
+        """The user spoke during a listening window: abandon the rest of the reply.
+
+        Nothing is playing (the segment drained before the window opened), so
+        there is no playback to stop -- the interruption is simply the app never
+        sending the audio it was holding. OpenAI's own interrupt_response stops
+        it generating more.
+        """
+        self._barge_in_detected = True
+        self._listening_for_barge_in = False
+        self._awaiting_segment_playback = False
+        # The interrupted reply's held tail is abandoned, not deferred.
+        self._finalize_deferred = False
+        self._cancel_listen_window()
+
+        async with self._buffer_lock:
+            discarded = len(self._audio_buffer)
+            self._audio_buffer.clear()
+
+        self._cancel_unmute_timeout()
+        self._pending_playback_seq = None
+        self._ai_speaking = False
+        self._mic_muted = False
+        self._chunks_sent_this_response = 0
+        self._response_duration_ms = 0
+        log.info("audio_bridge.barge_in_detected", discarded_bytes=discarded)
 
     async def _finalize_response_audio(self) -> None:
         """Flush remaining audio (plus a trailing silence pad) and arm unmute gating."""
+        if self._listening_for_barge_in or self._awaiting_segment_playback:
+            # The reply finished generating while a barge-in boundary was in
+            # flight. Finalizing now would push the held tail into a speaker the
+            # window depends on staying quiet; the window's own close path
+            # finalizes instead, once it has resumed and drained the remainder.
+            self._finalize_deferred = True
+            log.debug("audio_bridge.finalize_deferred_for_barge_in")
+            return
+
         async with self._buffer_lock:
             has_audio = self._chunks_sent_this_response > 0 or len(self._audio_buffer) > 0
             if has_audio and TAIL_SILENCE:
@@ -937,12 +1148,19 @@ class AudioBridge:
         try:
             async for event in self._realtime_client.iter_events():
                 if isinstance(event, RealtimeAudioDelta):
+                    if self._barge_in_detected:
+                        # Interrupted reply still draining out of OpenAI before
+                        # its cancel lands. Discard these -- buffering them
+                        # would re-mute the mic and talk over the user.
+                        continue
                     if not self._ai_speaking:
                         self._ai_speaking = True
                         self._set_conversation_state("ai_speaking")
                         self._audio_seq += 1
                         self._chunks_sent_this_response = 0
                         self._response_duration_ms = 0
+                        self._quiet_chunk_run = 0
+                        self._segment_ms_sent = 0
                         await self._send_mute(True)
 
                     async with self._buffer_lock:
@@ -967,6 +1185,14 @@ class AudioBridge:
                     if self._awaiting_opening_greeting:
                         self._awaiting_opening_greeting = False
                         log.info("audio_bridge.opening_greeting_complete")
+                    if self._barge_in_detected:
+                        # The reply the user interrupted. _handle_barge_in
+                        # already dropped its audio and released the mic; there
+                        # is nothing to flush or finalize. Clear the flag so the
+                        # reply to what they just said is handled normally.
+                        self._barge_in_detected = False
+                        log.info("audio_bridge.barge_in_response_closed")
+                        continue
                     await self._flush_partial_chunks()
                     # Finalize while _explicit_greeting_pending is still set so
                     # the greeting's playback arms the waiting_for_kid nudge.
@@ -977,6 +1203,12 @@ class AudioBridge:
                     if self._should_ignore_live_speech_vad():
                         log.debug("audio_bridge.speech_started_ignored")
                         continue
+                    if self._listening_for_barge_in:
+                        # Phase 6a: the user started talking in a pause of the
+                        # assistant's own reply. Drop the rest of that reply
+                        # before arming the turn below, so the two do not
+                        # overlap.
+                        await self._handle_barge_in()
                     # A genuine user turn (past greeting/AI-speech/recovery):
                     # arm now, before response.created, so the phantom guard
                     # above doesn't cancel the child's first real response.

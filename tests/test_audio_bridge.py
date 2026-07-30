@@ -1198,3 +1198,398 @@ class TestHandleAudioGap:
         await bridge.handle_audio_gap({"duration_ms": 0, "sequence_number": 1})
 
         realtime.send_audio.assert_not_awaited()
+
+
+def _barge_in_config(enabled: bool = True):
+    from voice_assistant.config import Config
+
+    return Config(openai_api_key="", barge_in=enabled)
+
+
+def _speech(ms: int) -> bytes:
+    """PCM loud enough to clear BARGE_IN_SILENCE_RMS."""
+    import struct
+
+    from voice_assistant.audio.bridge import BYTE_RATE
+
+    samples = int(BYTE_RATE * ms / 1000) // 2
+    return struct.pack("<h", 8000) * samples
+
+
+def _quiet(ms: int) -> bytes:
+    from voice_assistant.audio.bridge import BYTE_RATE
+
+    return b"\x00" * (int(BYTE_RATE * ms / 1000) & ~1)
+
+
+class TestBargeInGapDetection:
+    """Phase 6a: segment the reply at a pause, listen while the device drains."""
+
+    def test_disabled_by_default(self) -> None:
+        bridge = AudioBridge(_make_mock_transport(), loopback=False)
+        assert bridge._barge_in_enabled is False
+
+    def test_disabled_in_loopback_even_when_flag_is_on(self) -> None:
+        """Loopback has no assistant reply to interrupt, so the flag can't apply."""
+        bridge = AudioBridge(
+            _make_mock_transport(), loopback=True, config=_barge_in_config(True),
+        )
+        assert bridge._barge_in_enabled is False
+
+    def test_boundary_needs_a_long_enough_run_of_quiet(self) -> None:
+        from voice_assistant.audio.bridge import (
+            BARGE_IN_MIN_GAP_CHUNKS,
+            PLAY_AUDIO_CHUNK_BYTES,
+        )
+
+        bridge = AudioBridge(
+            _make_mock_transport(), loopback=False, config=_barge_in_config(),
+        )
+        quiet_chunk = b"\x00" * PLAY_AUDIO_CHUNK_BYTES
+        bridge._segment_ms_sent = 5000  # well past the min-segment floor
+
+        for _ in range(BARGE_IN_MIN_GAP_CHUNKS - 1):
+            assert bridge._is_barge_in_boundary(quiet_chunk) is False
+        assert bridge._is_barge_in_boundary(quiet_chunk) is True
+
+    def test_speech_resets_the_quiet_run(self) -> None:
+        from voice_assistant.audio.bridge import (
+            BARGE_IN_MIN_GAP_CHUNKS,
+            PLAY_AUDIO_CHUNK_BYTES,
+        )
+        import struct
+
+        bridge = AudioBridge(
+            _make_mock_transport(), loopback=False, config=_barge_in_config(),
+        )
+        quiet_chunk = b"\x00" * PLAY_AUDIO_CHUNK_BYTES
+        loud_chunk = struct.pack("<h", 8000) * (PLAY_AUDIO_CHUNK_BYTES // 2)
+        bridge._segment_ms_sent = 5000
+
+        for _ in range(BARGE_IN_MIN_GAP_CHUNKS - 1):
+            bridge._is_barge_in_boundary(quiet_chunk)
+        assert bridge._is_barge_in_boundary(loud_chunk) is False
+        # Run restarted: one more quiet chunk must not be enough on its own.
+        assert bridge._is_barge_in_boundary(quiet_chunk) is False
+
+    def test_no_boundary_when_flag_is_off(self) -> None:
+        from voice_assistant.audio.bridge import (
+            BARGE_IN_MIN_GAP_CHUNKS,
+            PLAY_AUDIO_CHUNK_BYTES,
+        )
+
+        bridge = AudioBridge(_make_mock_transport(), loopback=False)
+        quiet_chunk = b"\x00" * PLAY_AUDIO_CHUNK_BYTES
+
+        for _ in range(BARGE_IN_MIN_GAP_CHUNKS + 4):
+            assert bridge._is_barge_in_boundary(quiet_chunk) is False
+
+    def test_min_segment_floor_counts_delivered_audio_not_wall_clock(self) -> None:
+        """The floor has to be measured in audio actually delivered. Responses
+        stream out of OpenAI far faster than real time, so a wall-clock floor
+        would read ~0 ms for an entire reply and never suppress anything."""
+        from voice_assistant.audio.bridge import (
+            BARGE_IN_MIN_GAP_CHUNKS,
+            BARGE_IN_MIN_SEGMENT_MS,
+            PLAY_AUDIO_CHUNK_BYTES,
+        )
+
+        bridge = AudioBridge(
+            _make_mock_transport(), loopback=False, config=_barge_in_config(),
+        )
+        quiet_chunk = b"\x00" * PLAY_AUDIO_CHUNK_BYTES
+
+        # Barely any audio delivered in this segment yet: no boundary, however
+        # long the pause runs.
+        bridge._segment_ms_sent = BARGE_IN_MIN_SEGMENT_MS - 100
+        for _ in range(BARGE_IN_MIN_GAP_CHUNKS + 4):
+            assert bridge._is_barge_in_boundary(quiet_chunk) is False
+
+        # Same pause, once enough of the reply has actually been delivered.
+        bridge._segment_ms_sent = BARGE_IN_MIN_SEGMENT_MS
+        bridge._quiet_chunk_run = 0
+        for _ in range(BARGE_IN_MIN_GAP_CHUNKS - 1):
+            assert bridge._is_barge_in_boundary(quiet_chunk) is False
+        assert bridge._is_barge_in_boundary(quiet_chunk) is True
+
+
+class TestBargeInWindow:
+    """The listening window itself: opened by the drained segment's reply."""
+
+    async def _bridge_mid_response(self):
+        transport = _make_mock_transport()
+        bridge = AudioBridge(
+            transport, loopback=False, config=_barge_in_config(),
+        )
+        bridge.start()
+        bridge.set_device_ready(True)
+        bridge._ai_speaking = True
+        bridge._mic_muted = True
+        return transport, bridge
+
+    async def test_playback_complete_at_a_segment_opens_the_window(self) -> None:
+        transport, bridge = await self._bridge_mid_response()
+        bridge._awaiting_segment_playback = True
+        bridge._pending_playback_seq = 7
+
+        await bridge.handle_playback_complete({"sequence_number": 7, "duration_ms": 500})
+        await asyncio.sleep(0)
+
+        assert bridge._listening_for_barge_in is True
+        # Mic released so the device streams during the pause.
+        unmutes = [
+            c for c in transport.send_message.call_args_list
+            if c[0][0].type == MessageType.UNMUTE_MIC
+        ]
+        assert len(unmutes) == 1
+        # Still the same assistant turn -- not the end-of-reply path.
+        assert bridge._ai_speaking is True
+        bridge._cancel_listen_window()
+
+    async def test_window_closes_and_resumes_the_reply(self) -> None:
+        from voice_assistant.audio.bridge import PLAY_AUDIO_CHUNK_BYTES
+
+        transport, bridge = await self._bridge_mid_response()
+        bridge._awaiting_segment_playback = True
+        bridge._pending_playback_seq = 7
+        bridge._audio_seq = 7
+        # The rest of the reply, held back while the window is open.
+        held = _speech(200)
+        async with bridge._buffer_lock:
+            bridge._audio_buffer.extend(held)
+
+        with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "voice_assistant.audio.bridge.BARGE_IN_WINDOW_MS", 20,
+        ):
+            await bridge.handle_playback_complete(
+                {"sequence_number": 7, "duration_ms": 500},
+            )
+            # Nothing may go out while the window is open.
+            await asyncio.sleep(0.005)
+            assert not [
+                c for c in transport.send_message.call_args_list
+                if c[0][0].type == MessageType.PLAY_AUDIO
+            ]
+            await asyncio.sleep(0.08)
+
+        assert bridge._listening_for_barge_in is False
+        assert bridge._audio_seq == 8  # next segment gets its own sequence
+        mutes = [
+            c for c in transport.send_message.call_args_list
+            if c[0][0].type == MessageType.MUTE_MIC
+        ]
+        assert len(mutes) == 1  # re-muted once the window closed
+        played = [
+            c for c in transport.send_message.call_args_list
+            if c[0][0].type == MessageType.PLAY_AUDIO
+        ]
+        assert played, "held audio was never resumed after the window"
+        delivered = b"".join(as_pcm_bytes(c[0][0].payload["audio"]) for c in played)
+        assert delivered == held[: len(delivered)]
+        assert len(delivered) % PLAY_AUDIO_CHUNK_BYTES == 0
+
+    async def test_vad_is_trusted_only_inside_the_window(self) -> None:
+        _transport, bridge = await self._bridge_mid_response()
+
+        # Mid-speech, no window: VAD is the device's own echo, ignore it.
+        assert bridge._should_ignore_live_speech_vad() is True
+
+        bridge._listening_for_barge_in = True
+        # Window open: the segment drained, so the speaker is quiet and VAD
+        # firing here is the user.
+        assert bridge._should_ignore_live_speech_vad() is False
+
+    async def test_barge_in_drops_the_rest_of_the_reply(self) -> None:
+        _transport, bridge = await self._bridge_mid_response()
+        bridge._listening_for_barge_in = True
+        async with bridge._buffer_lock:
+            bridge._audio_buffer.extend(_speech(500))
+
+        await bridge._handle_barge_in()
+
+        assert bridge._barge_in_detected is True
+        assert bridge._listening_for_barge_in is False
+        assert len(bridge._audio_buffer) == 0
+        assert bridge._ai_speaking is False
+        # The user is talking -- the mic must stay open.
+        assert bridge._mic_muted is False
+
+    async def test_deltas_after_a_barge_in_are_discarded(self) -> None:
+        """OpenAI keeps streaming briefly before its cancel lands; that audio
+        must not re-mute the mic and talk over the user."""
+        transport, bridge = await self._bridge_mid_response()
+        bridge._barge_in_detected = True
+
+        event_queue: asyncio.Queue = asyncio.Queue()
+        await event_queue.put(RealtimeAudioDelta(pcm_bytes=_speech(300)))
+        await event_queue.put(RealtimeResponseDone(response_id="r-interrupted"))
+
+        realtime = AsyncMock()
+        realtime.is_connected = True
+
+        async def fake_iter():
+            while True:
+                event = await event_queue.get()
+                if event is None:
+                    return
+                yield event
+
+        realtime.iter_events = fake_iter
+        bridge._realtime_client = realtime
+        task = asyncio.create_task(bridge._process_realtime_events())
+        await asyncio.sleep(0.05)
+        await event_queue.put(None)
+        await task
+
+        assert not [
+            c for c in transport.send_message.call_args_list
+            if c[0][0].type == MessageType.PLAY_AUDIO
+        ]
+        # Flag cleared by response.done, so the *next* reply is handled normally.
+        assert bridge._barge_in_detected is False
+
+    async def test_finalize_during_a_window_is_deferred_not_dropped(self) -> None:
+        """A reply that finishes generating mid-window still gets delivered --
+        after the window, never into a speaker it needs quiet."""
+        transport, bridge = await self._bridge_mid_response()
+        bridge._listening_for_barge_in = True
+        async with bridge._buffer_lock:
+            bridge._audio_buffer.extend(_speech(100))
+
+        await bridge._finalize_response_audio()
+
+        assert bridge._finalize_deferred is True
+        assert not [
+            c for c in transport.send_message.call_args_list
+            if c[0][0].type == MessageType.PLAY_AUDIO
+        ]
+        assert len(bridge._audio_buffer) > 0  # held, not discarded
+
+    async def test_reset_on_disconnect_drops_an_open_window(self) -> None:
+        _transport, bridge = await self._bridge_mid_response()
+        bridge._awaiting_segment_playback = True
+        bridge._pending_playback_seq = 3
+        await bridge.handle_playback_complete({"sequence_number": 3, "duration_ms": 100})
+        await asyncio.sleep(0.01)  # let the window task actually start
+        assert bridge._listening_for_barge_in is True
+
+        await bridge.reset_on_disconnect()
+
+        assert bridge._listening_for_barge_in is False
+        assert bridge._listen_window_task is None
+
+
+class TestChunkRms:
+    def test_matches_the_device_definition(self) -> None:
+        """Same function shape as the devices' audio_gating.chunk_rms, so a
+        threshold means the same thing on both sides of the wire."""
+        import struct
+
+        from voice_assistant.audio.utils import chunk_rms
+
+        assert chunk_rms(b"") == 0.0
+        assert chunk_rms(b"\x00\x00" * 100) == 0.0
+        loud = struct.pack("<h", 20000) * 100
+        assert chunk_rms(loud) == 20000.0
+        assert chunk_rms(loud, stride=4) == 20000.0
+
+
+class TestBargeInEndToEnd:
+    """The whole Phase 6a loop: a reply with a pause in it, segmented, listened
+    in, and then either resumed or interrupted."""
+
+    async def _run(self, *, interrupt: bool):
+        from unittest.mock import patch
+
+        transport = _make_mock_transport()
+        bridge = AudioBridge(transport, loopback=False, config=_barge_in_config())
+        bridge.start()
+        bridge.set_device_ready(True)
+
+        # A reply shaped like real TTS: a sentence, a 500 ms sentence pause, a
+        # second sentence. The pause is what Phase 6a listens in. The first
+        # sentence has to clear BARGE_IN_MIN_SEGMENT_MS of *delivered audio*
+        # before a boundary is allowed at all.
+        reply = _speech(1600) + _quiet(500) + _speech(600)
+        event_queue: asyncio.Queue = asyncio.Queue()
+        await event_queue.put(RealtimeAudioDelta(pcm_bytes=reply))
+
+        realtime = AsyncMock()
+        realtime.is_connected = True
+
+        async def fake_iter():
+            while True:
+                event = await event_queue.get()
+                if event is None:
+                    return
+                yield event
+
+        realtime.iter_events = fake_iter
+        bridge._realtime_client = realtime
+
+        def play_calls():
+            return [
+                c for c in transport.send_message.call_args_list
+                if c[0][0].type == MessageType.PLAY_AUDIO
+            ]
+
+        with patch("voice_assistant.audio.bridge.BARGE_IN_WINDOW_MS", 30):
+            bridge._event_task = asyncio.create_task(bridge._process_realtime_events())
+            await asyncio.sleep(0.05)
+
+            # The pause should have ended a segment: a final chunk, then silence
+            # on the wire while the app waits for the device to drain.
+            finals = [c for c in play_calls() if c[0][0].payload["is_final"]]
+            assert len(finals) == 1, "the pause did not end a segment"
+            assert bridge._awaiting_segment_playback is True
+            segment_seq = finals[0][0][0].payload["sequence_number"]
+            sent_before_window = len(play_calls())
+
+            # The device drains and replies -- this is what opens the window.
+            await bridge.handle_playback_complete(
+                {"sequence_number": segment_seq, "duration_ms": 600},
+            )
+            await asyncio.sleep(0.01)
+            assert bridge._listening_for_barge_in is True
+            assert len(play_calls()) == sent_before_window, "sent into an open window"
+
+            if interrupt:
+                await bridge._handle_barge_in()
+
+            await event_queue.put(RealtimeResponseDone(response_id="r1"))
+            await asyncio.sleep(0.15)
+            await event_queue.put(None)
+            await bridge._event_task
+
+        bridge._cancel_unmute_timeout()
+        return transport, bridge, play_calls(), reply
+
+    async def test_reply_resumes_when_nobody_interrupts(self) -> None:
+        transport, bridge, calls, reply = await self._run(interrupt=False)
+
+        assert bridge._listening_for_barge_in is False
+        delivered = b"".join(as_pcm_bytes(c[0][0].payload["audio"]) for c in calls)
+        # Everything OpenAI produced still reaches the speaker, in order, with
+        # the usual tail pad -- segmenting must not lose or reorder audio.
+        assert delivered == reply + TAIL_SILENCE
+        assert calls[-1][0][0].payload["is_final"] is True
+        # Two segments were cut, so two sequence numbers were used.
+        seqs = {c[0][0].payload["sequence_number"] for c in calls}
+        assert len(seqs) == 2
+        unmutes = [
+            c for c in transport.send_message.call_args_list
+            if c[0][0].type == MessageType.UNMUTE_MIC
+        ]
+        assert len(unmutes) == 1  # exactly one listening window
+
+    async def test_interrupted_reply_is_abandoned_after_the_pause(self) -> None:
+        _transport, bridge, calls, reply = await self._run(interrupt=True)
+
+        delivered = b"".join(as_pcm_bytes(c[0][0].payload["audio"]) for c in calls)
+        # The user cut in during the pause, so the second phrase never plays.
+        assert len(delivered) < len(reply)
+        assert delivered == reply[: len(delivered)]
+        assert bridge._ai_speaking is False
+        assert bridge._mic_muted is False  # the user has the floor
+        assert bridge._barge_in_detected is False  # cleared by response.done
+        assert len(bridge._audio_buffer) == 0

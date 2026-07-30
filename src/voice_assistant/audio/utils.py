@@ -115,6 +115,25 @@ def compute_audio_level(pcm_bytes: bytes) -> tuple[float, bool]:
     return peak / 32767.0, peak >= 32760
 
 
+def chunk_rms(pcm_bytes: bytes, stride: int = 1) -> float:
+    """Root-mean-square level for a PCM16 little-endian chunk.
+
+    Deliberately the same shape (and the same `stride` subsampling option) as
+    the device clients' `audio_gating.chunk_rms`, so a threshold measured on
+    one side means the same thing on the other. `compute_audio_level` above
+    answers a different question — it reports *peak* for the dashboard meter,
+    where a single loud sample should light the bar; RMS is what you want to
+    judge whether a chunk is silence.
+    """
+    if len(pcm_bytes) < 2:
+        return 0.0
+    count = len(pcm_bytes) // 2
+    samples = struct.unpack(f"<{count}h", pcm_bytes[: count * 2])[::stride]
+    if not samples:
+        return 0.0
+    return (sum(s * s for s in samples) / len(samples)) ** 0.5
+
+
 def generate_test_tone(
     duration_ms: int,
     frequency: int = 440,

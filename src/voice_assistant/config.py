@@ -63,6 +63,11 @@ class Config:
     # regardless of what it advertises, without a device-side change or a
     # rollback.
     binary_audio_frames: bool = True
+    # Phase 6a of the battery plan: let the user interrupt the assistant by
+    # opening a brief listening window in the natural pauses of its own speech.
+    # Off by default -- it changes response pacing and costs radio time, both of
+    # which want judging by ear on real hardware before becoming the default.
+    barge_in: bool = False
 
 
 def load_config() -> Config:
@@ -101,6 +106,7 @@ def load_config() -> Config:
         web_port=int(os.getenv("WEB_PORT", "8080")),
         binary_audio_frames=os.getenv("BINARY_AUDIO_FRAMES", "true").lower()
         in ("true", "1", "yes"),
+        barge_in=os.getenv("BARGE_IN", "false").lower() in ("true", "1", "yes"),
     )
 
 
