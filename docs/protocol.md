@@ -228,6 +228,35 @@ A chunk of captured microphone audio. Sent continuously while the device is reco
 
 ---
 
+#### `AUDIO_GAP`
+
+Sent instead of a run of `AUDIO_FRAME`s when the device elides silence
+(Phase 5b of `voice-assistant-piZero2W/docs/battery-plan.md`, opt-in via the
+device's `ELIDE_SILENCE` env var, off by default). The app must synthesize
+`duration_ms` of silent PCM16 and feed it to OpenAI in place of the elided
+audio, so the Realtime session's turn detection sees the same timeline it
+would have if every chunk had been sent.
+
+**Payload:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `duration_ms` | integer | How much silence was elided. |
+| `sequence_number` | integer | The value the **next real** `AUDIO_FRAME` will carry. Elided chunks never increment the sequence counter, so a jump in consecutive `AUDIO_FRAME` sequence numbers with no preceding `AUDIO_GAP` is a genuinely dropped frame; a jump explained by one is intentional elision. |
+| `reason` | string | Always `"silence"` today. Kept general so a future gate (e.g. eliding non-target-speaker audio) can reuse this same message type instead of a second one. |
+
+**Example:**
+
+```json
+{
+  "type": "AUDIO_GAP",
+  "payload": { "duration_ms": 850, "sequence_number": 12, "reason": "silence" },
+  "timestamp": "2026-06-30T15:30:01.000Z"
+}
+```
+
+---
+
 #### `CALIBRATION_STATUS`
 
 Sent by the device during the calibration phase to report which step it is on. Used only to drive UI feedback; the app takes no control action on it.
@@ -261,6 +290,7 @@ Sent by the device **only after it has captured a genuine user "hello"** in resp
 | `speech_detected` | boolean | **Must be `true` only when the device actually heard the user speak.** The device must not report `true` for its own "say hello to start" prompt bleeding into the mic, or for ambient room noise. If it is `false`, the app rejects calibration and the device should re-prompt. |
 | `noise_floor` | number | Ambient RMS level measured during the quiet phase. |
 | `user_speech_peak` | number | Peak RMS level measured while the user spoke. The app requires `user_speech_peak - noise_floor >= 80`, otherwise it rejects calibration as "too quiet". |
+| `speech_threshold` | number | `noise_floor + (user_speech_peak - noise_floor) * 0.32` — the RMS level the device itself uses to gate silence elision (`AUDIO_GAP`) when `ELIDE_SILENCE` is on. Informational for the app; nothing on this side currently consumes it. |
 
 The app derives OpenAI voice-activity-detection settings from `noise_floor` and `user_speech_peak`, then caches them so a later resume can skip re-calibration.
 
@@ -272,7 +302,8 @@ The app derives OpenAI voice-activity-detection settings from `noise_floor` and 
   "payload": {
     "speech_detected": true,
     "noise_floor": 320.0,
-    "user_speech_peak": 910.0
+    "user_speech_peak": 910.0,
+    "speech_threshold": 508.8
   },
   "timestamp": "2026-06-30T15:00:05.000Z"
 }
