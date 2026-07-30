@@ -563,6 +563,15 @@ class SessionManager:
                     audio_bytes=len(payload.get("audio", "")),
                     iteration=iteration,
                 )
+            case MessageType.AUDIO_GAP:
+                if self._audio_bridge is not None:
+                    await self._audio_bridge.handle_audio_gap(payload)
+                log.debug(
+                    "session.audio_gap",
+                    duration_ms=payload.get("duration_ms"),
+                    seq=payload.get("sequence_number"),
+                    reason=payload.get("reason"),
+                )
             case MessageType.DEVICE_STATUS:
                 log.info(
                     "session.device_status",
